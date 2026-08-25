@@ -1,14 +1,29 @@
 @echo off
+chcp 932 >nul
 setlocal
 set CSC=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 if not exist "%CSC%" (
-  echo csc.exe ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: %CSC%
+  echo csc.exe ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ: %CSC%
   exit /b 1
 )
 if not exist "%~dp0bin" mkdir "%~dp0bin"
+
+echo [1/3] LvKSyncServer
+"%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0bin\LvKSyncServer.exe" "%~dp0src\Common.cs" "%~dp0src\Server.cs"
+if errorlevel 1 goto :fail
+
+echo [2/3] LvKSyncClient
+"%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0bin\LvKSyncClient.exe" "%~dp0src\Common.cs" "%~dp0src\Client.cs"
+if errorlevel 1 goto :fail
+
+echo [3/3] SyncLvK ^(‹Œ: ó‘Ô“¯ŠúE2l^)
 "%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0bin\SyncLvK.exe" "%~dp0src\SyncLvK.cs"
-if errorlevel 1 (
-  echo ãƒ“ãƒ«ãƒ‰å¤±æ•—
-  exit /b 1
-)
-echo ãƒ“ãƒ«ãƒ‰æˆåŠŸ: %~dp0bin\SyncLvK.exe
+if errorlevel 1 goto :fail
+
+echo.
+echo ƒrƒ‹ƒh¬Œ÷: %~dp0bin
+exit /b 0
+
+:fail
+echo ƒrƒ‹ƒh¸”s
+exit /b 1

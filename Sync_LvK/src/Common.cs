@@ -1,0 +1,447 @@
+// LvKSync 共通コード
+//   - RPG_RT のプロセスメモリ読み書き
+//   - 変数配列ベースの自動特定
+//   - ネットワークプロトコル
+//   - 設定ファイル
+//
+// C# 5 / .NET Framework 4.x。外部依存なし。
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace LvKSync
+{
+    #region Win32
+
+    internal static class Native
+    {
+        public const int PROCESS_VM_READ = 0x0010;
+        public const int PROCESS_VM_WRITE = 0x0020;
+        public const int PROCESS_VM_OPERATION = 0x0008;
+        public const int PROCESS_QUERY_INFORMATION = 0x0400;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+        [DllImport("kernel32.dll")]
+        public static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll")]
+        public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out int read);
+        [DllImport("kernel32.dll")]
+        public static extern bool WriteProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out int written);
+        [DllImport("kernel32.dll")]
+        public static extern int VirtualQueryEx(IntPtr h, IntPtr addr, out MEMORY_BASIC_INFORMATION mbi, int len);
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vk);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MEMORY_BASIC_INFORMATION
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        public const uint MEM_COMMIT = 0x1000;
+        public const uint PAGE_GUARD = 0x100;
+    }
+
+    #endregion
+
+    #region プロセスメモリ
+
+    public sealed class GameMemory : IDisposable
+    {
+        private IntPtr _h;
+        private readonly byte[] _s4 = new byte[4];
+
+        public int Pid { get; private set; }
+        public long VarBase { get; set; }
+
+        public GameMemory(int pid)
+        {
+            Pid = pid;
+            _h = Native.OpenProcess(
+                Native.PROCESS_VM_READ | Native.PROCESS_VM_WRITE |
+                Native.PROCESS_VM_OPERATION | Native.PROCESS_QUERY_INFORMATION, false, pid);
+            if (_h == IntPtr.Zero)
+                throw new InvalidOperationException("OpenProcess に失敗しました (pid=" + pid +
+                    ", err=" + Marshal.GetLastWin32Error() + ")。管理者権限が必要な場合があります。");
+        }
+
+        public int ReadVar(int index)
+        {
+            int got;
+            if (!Native.ReadProcessMemory(_h, (IntPtr)(VarBase + (long)index * 4), _s4, 4, out got)) return 0;
+            return BitConverter.ToInt32(_s4, 0);
+        }
+
+        public void WriteVar(int index, int value)
+        {
+            int wrote;
+            Native.WriteProcessMemory(_h, (IntPtr)(VarBase + (long)index * 4),
+                BitConverter.GetBytes(value), 4, out wrote);
+        }
+
+        public void ReadVars(int[] idx, int[] dst)
+        {
+            for (int i = 0; i < idx.Length; i++) dst[i] = ReadVar(idx[i]);
+        }
+
+        public void WriteVars(int[] idx, int[] src)
+        {
+            for (int i = 0; i < idx.Length; i++) WriteVar(idx[i], src[i]);
+        }
+
+        public bool ReadRaw(long addr, byte[] buf, int size)
+        {
+            int got;
+            return Native.ReadProcessMemory(_h, (IntPtr)addr, buf, size, out got) && got == size;
+        }
+
+        public bool Alive
+        {
+            get
+            {
+                try { var p = Process.GetProcessById(Pid); return !p.HasExited; }
+                catch { return false; }
+            }
+        }
+
+        internal sealed class Region { public long Base; public int Size; public byte[] Data; }
+
+        internal List<Region> Snapshot(bool withData)
+        {
+            var list = new List<Region>();
+            long addr = 0x10000;
+            const long max = 0x7FFFFFFF0000;
+            long total = 0;
+            while (addr < max)
+            {
+                Native.MEMORY_BASIC_INFORMATION mbi;
+                if (Native.VirtualQueryEx(_h, (IntPtr)addr, out mbi,
+                        Marshal.SizeOf(typeof(Native.MEMORY_BASIC_INFORMATION))) == 0) break;
+                long rs = (long)mbi.RegionSize;
+                if (rs <= 0) break;
+
+                uint pr = mbi.Protect & 0xFF;
+                bool writable = (pr == 0x04 || pr == 0x40 || pr == 0x08 || pr == 0x80);
+                bool guarded = (mbi.Protect & Native.PAGE_GUARD) != 0;
+                if (mbi.State == Native.MEM_COMMIT && writable && !guarded
+                    && rs >= 0x1000 && rs <= 512L * 1024 * 1024 && total < 3000L * 1024 * 1024)
+                {
+                    var r = new Region();
+                    r.Base = (long)mbi.BaseAddress;
+                    r.Size = (int)rs;
+                    if (withData)
+                    {
+                        r.Data = new byte[r.Size];
+                        int got;
+                        if (!Native.ReadProcessMemory(_h, mbi.BaseAddress, r.Data, r.Size, out got) || got != r.Size)
+                            r.Data = null;
+                    }
+                    if (!withData || r.Data != null) { list.Add(r); total += rs; }
+                }
+                addr += rs;
+            }
+            return list;
+        }
+
+        public void Dispose()
+        {
+            if (_h != IntPtr.Zero) { Native.CloseHandle(_h); _h = IntPtr.Zero; }
+        }
+    }
+
+    #endregion
+
+    #region 変数配列ベースの特定
+
+    public static class VarBaseFinder
+    {
+        public const int TickVar = 654;
+        private const int Sentinel = -999999999;
+        private static readonly int[] SentinelIdx = { 20001, 20002, 20201, 20202, 20401, 20402, 20601, 20602 };
+        private static readonly int[] AntiIdx = { 20000, 20003, 20200, 20203 };
+
+        public static long Find(GameMemory mem, out string method)
+        {
+            method = null;
+            var regs = mem.Snapshot(true);
+            var buf = new byte[4];
+
+            foreach (var r in regs)
+            {
+                for (int off = 0; off + 4 <= r.Size; off += 4)
+                {
+                    if (BitConverter.ToInt32(r.Data, off) != Sentinel) continue;
+                    long b0 = r.Base + off - 20001L * 4;
+                    bool ok = true;
+                    foreach (int k in SentinelIdx)
+                        if (!mem.ReadRaw(b0 + (long)k * 4, buf, 4) || BitConverter.ToInt32(buf, 0) != Sentinel) { ok = false; break; }
+                    if (ok)
+                        foreach (int k in AntiIdx)
+                            if (mem.ReadRaw(b0 + (long)k * 4, buf, 4) && BitConverter.ToInt32(buf, 0) == Sentinel) { ok = false; break; }
+                    if (ok && TickAdvancing(mem, b0)) { method = "sentinel"; return b0; }
+                }
+            }
+
+            foreach (var r in regs)
+            {
+                for (int off = 0; off + 80 <= r.Size; off += 4)
+                {
+                    if (BitConverter.ToInt32(r.Data, off) != 10201) continue;
+                    bool run = true;
+                    for (int k = 1; k < 20; k++)
+                        if (BitConverter.ToInt32(r.Data, off + k * 4) != 10201 + k) { run = false; break; }
+                    if (!run) continue;
+                    long b0 = r.Base + off - 1001L * 4;
+                    if (TickAdvancing(mem, b0)) { method = "index-table"; return b0; }
+                }
+            }
+            return 0;
+        }
+
+        private static bool TickAdvancing(GameMemory mem, long b0)
+        {
+            var buf = new byte[4];
+            if (!mem.ReadRaw(b0 + (long)TickVar * 4, buf, 4)) return false;
+            int t1 = BitConverter.ToInt32(buf, 0);
+            if (t1 <= 0 || t1 > 50000000) return false;
+            Thread.Sleep(120);
+            if (!mem.ReadRaw(b0 + (long)TickVar * 4, buf, 4)) return false;
+            return BitConverter.ToInt32(buf, 0) > t1;
+        }
+    }
+
+    #endregion
+
+    #region プロトコル
+
+    /// <summary>
+    /// メッセージ形式: [magic 4][type 1][len 1][payload len]
+    /// すべてリトルエンディアン。
+    /// </summary>
+    public static class Proto
+    {
+        public const uint Magic = 0x324B564C;   // "LVK2"
+        public const int MaxPlayers = 4;
+        public const int ButtonsPerPlayer = 6;
+
+        public const byte MsgHello = 1;    // C->S  [slotRequest 1]  0=おまかせ
+        public const byte MsgWelcome = 2;  // S->C  [slot 1][maxPlayers 1]
+        public const byte MsgInput = 3;    // C->S  [slot 1][frame 4][mask 2]
+        public const byte MsgFrame = 4;    // S->C  [frame 4][mask 2 x4][connected 1]
+        public const byte MsgBye = 5;      // 双方向
+        public const byte MsgFull = 6;     // S->C  空きスロットなし
+
+        public static byte[] Build(byte type, byte[] payload)
+        {
+            int n = payload == null ? 0 : payload.Length;
+            var b = new byte[6 + n];
+            Buffer.BlockCopy(BitConverter.GetBytes(Magic), 0, b, 0, 4);
+            b[4] = type;
+            b[5] = (byte)n;
+            if (n > 0) Buffer.BlockCopy(payload, 0, b, 6, n);
+            return b;
+        }
+
+        /// <summary>1メッセージを読み切る。切断時は null。</summary>
+        public static bool Read(NetworkStream s, out byte type, out byte[] payload)
+        {
+            type = 0; payload = null;
+            var head = new byte[6];
+            if (!ReadFull(s, head, 6)) return false;
+            if (BitConverter.ToUInt32(head, 0) != Magic) return false;
+            type = head[4];
+            int n = head[5];
+            payload = new byte[n];
+            if (n > 0 && !ReadFull(s, payload, n)) return false;
+            return true;
+        }
+
+        private static bool ReadFull(NetworkStream s, byte[] buf, int n)
+        {
+            int off = 0;
+            while (off < n)
+            {
+                int r;
+                try { r = s.Read(buf, off, n - off); }
+                catch { return false; }
+                if (r <= 0) return false;
+                off += r;
+            }
+            return true;
+        }
+
+        public static byte[] InputPayload(int slot, int frame, ushort mask)
+        {
+            var p = new byte[7];
+            p[0] = (byte)slot;
+            Buffer.BlockCopy(BitConverter.GetBytes(frame), 0, p, 1, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(mask), 0, p, 5, 2);
+            return p;
+        }
+
+        public static byte[] FramePayload(int frame, ushort[] masks, byte connected)
+        {
+            var p = new byte[4 + MaxPlayers * 2 + 1];
+            Buffer.BlockCopy(BitConverter.GetBytes(frame), 0, p, 0, 4);
+            for (int i = 0; i < MaxPlayers; i++)
+                Buffer.BlockCopy(BitConverter.GetBytes(masks[i]), 0, p, 4 + i * 2, 2);
+            p[4 + MaxPlayers * 2] = connected;
+            return p;
+        }
+    }
+
+    #endregion
+
+    #region 設定
+
+    public sealed class Ini
+    {
+        private readonly Dictionary<string, string> _map =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        public static Ini Load(string path)
+        {
+            var ini = new Ini();
+            if (!File.Exists(path)) return ini;
+            foreach (var raw in File.ReadAllLines(path, Encoding.UTF8))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0 || line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                ini._map[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+            }
+            return ini;
+        }
+
+        public string Get(string key, string def)
+        {
+            string v;
+            return _map.TryGetValue(key, out v) && v.Length > 0 ? v : def;
+        }
+
+        public int GetInt(string key, int def)
+        {
+            int v;
+            return int.TryParse(Get(key, null), NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : def;
+        }
+
+        public bool GetBool(string key, bool def)
+        {
+            string v = Get(key, null);
+            if (v == null) return def;
+            v = v.ToLowerInvariant();
+            return v == "1" || v == "true" || v == "yes" || v == "on";
+        }
+    }
+
+    #endregion
+
+    #region ユーティリティ
+
+    public static class Util
+    {
+        public static int[] ParseVars(string spec)
+        {
+            var list = new List<int>();
+            if (string.IsNullOrEmpty(spec)) return list.ToArray();
+            foreach (var raw in spec.Split(','))
+            {
+                var part = raw.Trim();
+                if (part.Length == 0) continue;
+                int dash = part.IndexOf('-', 1);
+                if (dash > 0)
+                {
+                    int lo, hi;
+                    if (int.TryParse(part.Substring(0, dash), out lo) && int.TryParse(part.Substring(dash + 1), out hi))
+                    {
+                        if (hi < lo) { int t = lo; lo = hi; hi = t; }
+                        for (int v = lo; v <= hi; v++) list.Add(v);
+                    }
+                }
+                else
+                {
+                    int v;
+                    if (int.TryParse(part, out v)) list.Add(v);
+                }
+            }
+            return list.ToArray();
+        }
+
+        public static List<Process> FindGames()
+        {
+            var list = new List<Process>();
+            foreach (var p in Process.GetProcessesByName("RPG_RT"))
+            {
+                try { if (!p.HasExited) list.Add(p); }
+                catch { }
+            }
+            list.Sort(delegate (Process a, Process b)
+            {
+                try { return a.StartTime.CompareTo(b.StartTime); }
+                catch { return a.Id.CompareTo(b.Id); }
+            });
+            return list;
+        }
+
+        /// <summary>"W,S,A,D,F,G" や "0x57,0x53,..." を仮想キーコード配列にする。</summary>
+        public static int[] ParseKeys(string spec)
+        {
+            var list = new List<int>();
+            foreach (var raw in spec.Split(','))
+            {
+                var t = raw.Trim();
+                if (t.Length == 0) continue;
+                if (t.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                {
+                    int v;
+                    if (int.TryParse(t.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v)) list.Add(v);
+                }
+                else if (t.Length == 1)
+                {
+                    list.Add(char.ToUpperInvariant(t[0]));
+                }
+                else
+                {
+                    switch (t.ToLowerInvariant())
+                    {
+                        case "up": list.Add(0x26); break;
+                        case "down": list.Add(0x28); break;
+                        case "left": list.Add(0x25); break;
+                        case "right": list.Add(0x27); break;
+                        case "space": list.Add(0x20); break;
+                        case "enter": list.Add(0x0D); break;
+                        case "shift": list.Add(0x10); break;
+                        case "ctrl": list.Add(0x11); break;
+                        default:
+                            int v;
+                            if (int.TryParse(t, out v)) list.Add(v);
+                            break;
+                    }
+                }
+            }
+            return list.ToArray();
+        }
+
+        public static bool KeyDown(int vk)
+        {
+            return (Native.GetAsyncKeyState(vk) & 0x8000) != 0;
+        }
+    }
+
+    #endregion
+}
