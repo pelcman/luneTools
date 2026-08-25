@@ -25,6 +25,19 @@
 ツクール側にネットワーク入力ブロックの受け取り処理が必要。
 インタフェースは1コマンドで済む。詳細は [Sync_LvK/README.md](Sync_LvK/README.md)。
 
+
+### [VPad](VPad/)
+
+**ViGEmBus と直接 IOCTL で話す仮想ゲームパッド。** Xbox360 互換のパッドを最大4本、
+ソフトウェアだけで生やす。`ViGEmClient.dll` を使わないので追加ライブラリ不要。
+
+4人対戦の検証のように、物理パッドが足りない場面で使う。
+
+```
+VPad.exe test --pads 4                   4本挿して認識を確認
+VPad.exe file --pads 4 --path pads.txt   ファイルで動的に操作
+```
+
 ## ビルド
 
 いずれも .NET Framework 4.x 同梱の `csc.exe` でビルドできる。外部依存なし。
