@@ -6,22 +6,23 @@ if not exist "%CSC%" (
   echo csc.exe が見つかりません: %CSC%
   exit /b 1
 )
-if not exist "%~dp0bin" mkdir "%~dp0bin"
+if not exist "%~dp0Server\bin" mkdir "%~dp0Server\bin"
+if not exist "%~dp0Client\bin" mkdir "%~dp0Client\bin"
 
-echo [1/3] LvKSyncServer
-"%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0bin\LvKSyncServer.exe" "%~dp0src\Common.cs" "%~dp0src\Server.cs"
+echo [1/3] Server\bin\LvKSyncServer.exe
+"%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0Server\bin\LvKSyncServer.exe" "%~dp0src\Common.cs" "%~dp0src\Server.cs"
 if errorlevel 1 goto :fail
 
-echo [2/3] LvKSyncClient
-"%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0bin\LvKSyncClient.exe" "%~dp0src\Common.cs" "%~dp0src\Client.cs"
+echo [2/3] Client\bin\LvKSyncClient.exe
+"%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0Client\bin\LvKSyncClient.exe" "%~dp0src\Common.cs" "%~dp0src\Client.cs"
 if errorlevel 1 goto :fail
 
-echo [3/3] SyncLvK ^(旧: 状態同期・2人^)
-"%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0bin\SyncLvK.exe" "%~dp0src\SyncLvK.cs"
+echo [3/3] Client\bin\SyncLvK.exe ^(旧: 状態同期^)
+"%CSC%" -nologo -platform:x64 -optimize+ -out:"%~dp0Client\bin\SyncLvK.exe" "%~dp0src\SyncLvK.cs"
 if errorlevel 1 goto :fail
 
 echo.
-echo ビルド成功: %~dp0bin
+echo ビルド成功
 exit /b 0
 
 :fail
