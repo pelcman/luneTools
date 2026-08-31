@@ -474,6 +474,19 @@ namespace LvKSync
             return t;
         }
 
+        /// <summary>
+        /// 配信フレーム。末尾に「ゲームフレーム0 に対応するサーバーフレーム」を付ける。
+        /// 古い形 (13バイト) も読めるように、後ろに足すだけにしてある。
+        /// </summary>
+        public static byte[] FramePayloadWithBase(int frame, ushort[] masks, byte connected, int matchBase)
+        {
+            var head = FramePayload(frame, masks, connected);
+            var p = new byte[head.Length + 4];
+            Buffer.BlockCopy(head, 0, p, 0, head.Length);
+            Buffer.BlockCopy(BitConverter.GetBytes(matchBase), 0, p, head.Length, 4);
+            return p;
+        }
+
         public static byte[] FramePayload(int frame, ushort[] masks, byte connected)
         {
             var p = new byte[4 + MaxPlayers * 2 + 1];
@@ -488,6 +501,62 @@ namespace LvKSync
     #endregion
 
     #region 設定
+
+    /// <summary>
+    /// 動いている間のできごとをファイルに残す。
+    /// 対戦中に何が起きたかを後から追えるようにするためのもの。
+    /// 開いたままでも他のソフトから読めるように共有指定で開く。
+    /// </summary>
+    public sealed class FileLogger : IDisposable
+    {
+        private readonly object _gate = new object();
+        private StreamWriter _w;
+
+        public string Path { get; private set; }
+        public string Dir { get; private set; }
+
+        /// <summary>exe と同じ場所の logs\ に、開始時刻の名前で作る。</summary>
+        public FileLogger(string prefix)
+        {
+            try
+            {
+                string baseDir = System.IO.Path.GetDirectoryName(
+                    System.Reflection.Assembly.GetExecutingAssembly().Location);
+                Dir = System.IO.Path.Combine(baseDir, "logs");
+                Directory.CreateDirectory(Dir);
+                Path = System.IO.Path.Combine(Dir,
+                    prefix + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
+                var fs = new FileStream(Path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                _w = new StreamWriter(fs, new UTF8Encoding(true));
+                _w.AutoFlush = true;
+                _w.WriteLine("# " + prefix + "  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            }
+            catch { _w = null; }
+        }
+
+        public void Write(string line)
+        {
+            var w = _w;
+            if (w == null) return;
+            lock (_gate)
+            {
+                try { w.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + "  " + line); }
+                catch { }
+            }
+        }
+
+        public void Dispose()
+        {
+            var w = _w;
+            _w = null;
+            if (w == null) return;
+            lock (_gate)
+            {
+                try { w.WriteLine("# 終了  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")); w.Dispose(); }
+                catch { }
+            }
+        }
+    }
 
     public sealed class Ini
     {

@@ -11,6 +11,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -22,7 +23,27 @@ namespace LvKSync
     internal sealed class ClientEngine
     {
         private const int Buttons = Proto.ButtonsPerPlayer;
-        private const int RingSize = 64;
+        private const int RingSize = 256;
+
+        /// <summary>試合のフレームカウンタとして妥当な上限。これを超えたら別の配列を見ている。</summary>
+        private const int MaxSaneTick = 1000000;
+
+        /// <summary>他より何フレーム進んだら待つか。</summary>
+        public int AheadLimit = 3;
+
+        /// <summary>
+        /// 進みすぎたときにゲームのプロセスを一瞬止めるか。
+        /// 止めると確実に揃うが、ゲーム側の時間が乱れるので既定では使わない。
+        /// ずれは入力遅延 (--delay) で吸収するのが基本。
+        /// </summary>
+        public bool ThrottleAhead;
+
+        // 進みすぎたときにゲームを一瞬止めるために使う
+        [DllImport("ntdll.dll")] private static extern int NtSuspendProcess(IntPtr h);
+        [DllImport("ntdll.dll")] private static extern int NtResumeProcess(IntPtr h);
+        [DllImport("kernel32.dll")] private static extern IntPtr OpenProcess(int a, bool b, int pid);
+        [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr h);
+        private IntPtr _susp = IntPtr.Zero;
 
         // --- 設定 ---
         public string Host = "127.0.0.1";
@@ -35,8 +56,22 @@ namespace LvKSync
         public bool ApplyOwn;
         public int[] Keys = new int[Buttons];
 
+        /// <summary>ゲームのフレーム番号で並べた入力。_ringFrame はその枠が何フレーム用か。</summary>
+        private readonly ushort[][] _ring = new ushort[RingSize][];
+        private readonly int[][] _ringFrame = new int[RingSize][];
+        private volatile int _serverFrame = -1;
+
         // --- 状態 (GUI が読む) ---
         public volatile int MySlot;
+        public volatile int AppliedFrame;      // いまゲームに書いているフレーム
+        private volatile int _matchBase = int.MinValue;   // 未使用 (旧方式の名残)
+        private volatile int _minGameFrame;                // 全員のうち一番遅れているフレーム
+        public volatile int AheadBy;                       // 自分が何フレーム進んでいるか
+        public long WaitCount;                             // 進みすぎて待った回数
+        private volatile int _gameFrame;       // サーバーへ知らせる自分のゲームframe
+        public volatile int FrameLag;          // サーバーより何フレーム後ろか
+        public volatile bool InMatch;
+        public long StallCount;                // 入力が間に合わなかった回数
         public volatile int MaxPlayers = Proto.MaxPlayers;
         public volatile int RttMs = -1;
         public volatile int ConnectedBits;
@@ -67,6 +102,14 @@ namespace LvKSync
         {
             _stop = false;
             MySlot = 0; RttMs = -1; TxCount = 0; RxCount = 0; VarBase = 0; Pid = 0;
+            _serverFrame = -1; AppliedFrame = 0; FrameLag = 0; InMatch = false; StallCount = 0;
+            _matchBase = int.MinValue; _gameFrame = 0;
+            for (int i = 0; i < RingSize; i++)
+            {
+                _ring[i] = new ushort[Proto.MaxPlayers];
+                _ringFrame[i] = new int[Proto.MaxPlayers];
+                for (int k = 0; k < Proto.MaxPlayers; k++) _ringFrame[i][k] = -1;
+            }
             Roster = new string[Proto.MaxPlayers + 1];
             RemoteMasks = new ushort[Proto.MaxPlayers];
             _worker = new Thread(Work) { IsBackground = true };
@@ -114,6 +157,12 @@ namespace LvKSync
                 Phase = "停止中";
                 try { if (_tcp != null) _tcp.Close(); } catch { }
                 _tcp = null; _st = null;
+                if (_susp != IntPtr.Zero)
+                {
+                    try { NtResumeProcess(_susp); } catch { }
+                    try { CloseHandle(_susp); } catch { }
+                    _susp = IntPtr.Zero;
+                }
                 var m = _mem; _mem = null;
                 if (m != null) m.Dispose();
                 Bump();
@@ -139,6 +188,8 @@ namespace LvKSync
 
             try { _mem = new GameMemory(pid); }
             catch (Exception ex) { Say(ex.Message); return; }
+            // 0x0800 = PROCESS_SUSPEND_RESUME  (進みすぎたときに一瞬止めるため)
+            try { _susp = OpenProcess(0x0800, false, pid); } catch { }
 
             // --- 変数配列を探す ---
             Phase = "ゲームのデータを探しています";
@@ -204,11 +255,30 @@ namespace LvKSync
                 if (!Proto.Read(st, out type, out p)) { _stop = true; Bump(); return; }
                 if (type == Proto.MsgFrame && p.Length >= 4 + Proto.MaxPlayers * 2 + 1)
                 {
+                    int frame = BitConverter.ToInt32(p, 0);
                     var m = new ushort[Proto.MaxPlayers];
                     for (int i = 0; i < Proto.MaxPlayers; i++) m[i] = BitConverter.ToUInt16(p, 4 + i * 2);
                     RemoteMasks = m;
                     ConnectedBits = p[4 + Proto.MaxPlayers * 2];
                     RxCount++;
+
+                    _serverFrame = frame;
+                    // 末尾に「全員のうち一番遅れているフレーム」が付いている
+                    if (p.Length >= 4 + Proto.MaxPlayers * 2 + 1 + 4)
+                        _minGameFrame = BitConverter.ToInt32(p, 4 + Proto.MaxPlayers * 2 + 1);
+                }
+                else if (type == Proto.MsgInput && p.Length >= 7)
+                {
+                    // フレーム番号付きの入力。そのフレーム用の枠に入れておく。
+                    int slot = p[0];
+                    int frame = BitConverter.ToInt32(p, 1);
+                    ushort mask = BitConverter.ToUInt16(p, 5);
+                    if (slot >= 1 && slot <= Proto.MaxPlayers && frame > 0)
+                    {
+                        int m = Mod(frame);
+                        _ring[m][slot - 1] = mask;
+                        _ringFrame[m][slot - 1] = frame;
+                    }
                 }
                 else if (type == Proto.MsgRoster)
                 {
@@ -241,6 +311,11 @@ namespace LvKSync
             }
         }
 
+        private static int Mod(int frame)
+        {
+            return ((frame % RingSize) + RingSize) % RingSize;
+        }
+
         private void MainLoop(int trackIndex)
         {
             var st = _st;
@@ -251,29 +326,141 @@ namespace LvKSync
             double frameMs = 1000.0 / 60.0;
             double nextDue = frameMs;
 
-            // 相手の入力を DelayFrames だけ遅らせて適用するための輪バッファ。
-            var ring = new ushort[RingSize][];
-            for (int i = 0; i < RingSize; i++) ring[i] = new ushort[Proto.MaxPlayers];
-            bool ringPrimed = false;
+            int lastTick = -1;          // ゲームのフレームカウンタ V[654]
+            int statNextTick = 0;
+            long statStall = 0;
+            var lastWritten = new ushort[Proto.MaxPlayers];
+            bool haveWritten = false;
 
             while (!_stop)
             {
                 if (!mem.Alive) { Say("ゲームが終了しました。"); break; }
 
                 // 対戦の開始・終了で変数配列は作り直される。追従する。
-                if (++refreshCounter >= 200)
+                // 遅れると古い配列を読んでしまうので、こまめに見る。
+                if (++refreshCounter >= 20)
                 {
                     refreshCounter = 0;
                     if (VarBaseFinder.Refresh(mem, trackIndex))
                     {
                         VarBase = mem.VarBase;
+                        lastTick = -1;
                         Say(string.Format("ゲームのデータが作り直されました。追従します  0x{0:X}", mem.VarBase));
                     }
                 }
 
-                // --- 送信: 自前の 60Hz で1回 ---
-                if (pacer.Elapsed.TotalMilliseconds >= nextDue)
+                // --- 適用 ---
+                // 試合中は V[654] が毎フレーム進む。これを合図にして、
+                // サーバーのフレーム番号で並べた入力を 1フレームぶんずつ消費する。
+                // こうすると「押している長さ」がどのインスタンスでも同じ数のフレームになる。
+                if (_serverFrame < 0) { Thread.Sleep(0); continue; }
+
+                int tick = mem.ReadVar(VarBaseFinder.TickVar);
+
+                // 作り直し前の配列を読むと、ありえない値になる。
+                // その場合はすぐ配列を取り直し、この回は何もしない。
+                if (tick < 0 || tick > MaxSaneTick)
                 {
+                    if (VarBaseFinder.Refresh(mem, trackIndex))
+                    {
+                        VarBase = mem.VarBase;
+                        lastTick = -1;
+                        InMatch = false;
+                        Say(string.Format("[INFO] ゲームのデータを取り直しました  0x{0:X}", mem.VarBase));
+                    }
+                    _gameFrame = 0;
+                    Thread.Sleep(1);
+                    continue;
+                }
+                _gameFrame = tick;
+
+                if (tick > 0)
+                {
+                    // --- 試合中 ---
+                    // ゲームが1フレーム進むごとに、自分の入力を DelayFrames 先のフレーム宛に送り、
+                    // このフレーム宛に届いている入力を当てる。実時間は一切使わないのでずれない。
+                    if (tick == lastTick) { Thread.Sleep(0); continue; }
+
+                    if (!InMatch || lastTick < 0 || tick < lastTick)
+                    {
+                        InMatch = true;
+                        for (int i = 0; i < RingSize; i++)
+                            for (int k = 0; k < Proto.MaxPlayers; k++) _ringFrame[i][k] = -1;
+                        for (int i = 0; i < Proto.MaxPlayers; i++) lastWritten[i] = 0;
+                        haveWritten = false;
+                        Say(string.Format("[INFO] 試合の同期を開始しました  ゲームframe={0}  遅延={1}",
+                            tick, DelayFrames));
+                    }
+                    lastTick = tick;
+                    AppliedFrame = tick;
+
+                    ushort mask = 0;
+                    for (int i = 0; i < Buttons; i++)
+                        if (Util.KeyDown(Keys[i])) mask |= (ushort)(1 << i);
+                    LocalMask = mask;
+                    var pkt = Proto.Build(Proto.MsgInput,
+                        Proto.InputPayload(MySlot, tick + DelayFrames, mask));
+                    try { lock (st) st.Write(pkt, 0, pkt.Length); TxCount++; }
+                    catch { Say("サーバーとの接続が切れました。"); break; }
+
+                    int mi = Mod(tick);
+                    var stampRow = _ringFrame[mi];
+                    var maskRow = _ring[mi];
+                    for (int s = 1; s <= Proto.MaxPlayers; s++)
+                    {
+                        if (s == MySlot && !ApplyOwn) continue;
+                        bool have = (stampRow[s - 1] == tick);
+                        if (!have) StallCount++;
+                        // 届いていないフレームは直前の入力を保つ
+                        ushort mk = have ? maskRow[s - 1] : lastWritten[s - 1];
+                        if (haveWritten && mk == lastWritten[s - 1]) continue;
+                        int b = NetBase + (s - 1) * Buttons;
+                        for (int i = 0; i < Buttons; i++)
+                            mem.WriteVar(b + i, ((mk >> i) & 1));
+                        lastWritten[s - 1] = mk;
+                    }
+                    haveWritten = true;
+                    FrameLag = 0;
+
+                    // 進みすぎていたら、ゲームを一瞬止めて他を待つ。
+                    // ここを止めないと、まだ届いていない入力のフレームに突っ込んでしまう。
+                    int minf = _minGameFrame;
+                    if (minf > 0)
+                    {
+                        AheadBy = (tick + DelayFrames) - minf;
+                        if (ThrottleAhead && AheadBy > AheadLimit && _susp != IntPtr.Zero)
+                        {
+                            WaitCount++;
+                            int ms = (AheadBy - AheadLimit) * 8;
+                            if (ms > 40) ms = 40;
+                            try
+                            {
+                                NtSuspendProcess(_susp);
+                                Thread.Sleep(ms);
+                                NtResumeProcess(_susp);
+                            }
+                            catch { }
+                        }
+                    }
+
+                    // 毎秒、取りこぼしの数を残す
+                    if (tick >= statNextTick)
+                    {
+                        if (statNextTick > 0)
+                            Say(string.Format("[INFO] frame={0}  取りこぼし {1}  進み {2}  待ち {3}",
+                                tick, StallCount - statStall, AheadBy, WaitCount));
+                        statStall = StallCount;
+                        statNextTick = tick + 60;
+                    }
+                }
+                else
+                {
+                    // --- 試合外 (タイトルやキャラ選択) ---
+                    statNextTick = 0;
+                    // フレームカウンタが動かないので、自前の 60Hz で送り、
+                    // 届いている最新の入力をそのまま反映する。
+                    if (InMatch) { InMatch = false; lastTick = -1; haveWritten = false; }
+                    if (pacer.Elapsed.TotalMilliseconds < nextDue) { Thread.Sleep(0); continue; }
                     nextDue += frameMs;
                     double behind = pacer.Elapsed.TotalMilliseconds - nextDue;
                     if (behind > frameMs * 4) nextDue = pacer.Elapsed.TotalMilliseconds + frameMs;
@@ -283,28 +470,24 @@ namespace LvKSync
                     for (int i = 0; i < Buttons; i++)
                         if (Util.KeyDown(Keys[i])) mask |= (ushort)(1 << i);
                     LocalMask = mask;
-
-                    var pkt = Proto.Build(Proto.MsgInput, Proto.InputPayload(MySlot, (int)localFrame, mask));
+                    var pkt = Proto.Build(Proto.MsgInput, Proto.InputPayload(MySlot, 0, mask));
                     try { lock (st) st.Write(pkt, 0, pkt.Length); TxCount++; }
                     catch { Say("サーバーとの接続が切れました。"); break; }
 
                     var cur = RemoteMasks;
-                    int slotIdx = (int)(localFrame % RingSize);
-                    for (int i = 0; i < Proto.MaxPlayers; i++) ring[slotIdx][i] = cur[i];
-                    if (localFrame >= DelayFrames) ringPrimed = true;
-                }
-
-                // --- 受信した他プレイヤーの入力を書き込む ---
-                ushort[] m2;
-                if (DelayFrames == 0 || !ringPrimed) m2 = RemoteMasks;
-                else m2 = ring[(int)(((localFrame - DelayFrames) % RingSize + RingSize) % RingSize)];
-                for (int s = 1; s <= Proto.MaxPlayers; s++)
-                {
-                    if (s == MySlot && !ApplyOwn) continue;
-                    int b = NetBase + (s - 1) * Buttons;
-                    ushort mk = m2[s - 1];
-                    for (int i = 0; i < Buttons; i++)
-                        mem.WriteVar(b + i, ((mk >> i) & 1));
+                    for (int s = 1; s <= Proto.MaxPlayers; s++)
+                    {
+                        if (s == MySlot && !ApplyOwn) continue;
+                        ushort mk = cur[s - 1];
+                        if (haveWritten && mk == lastWritten[s - 1]) continue;
+                        int b = NetBase + (s - 1) * Buttons;
+                        for (int i = 0; i < Buttons; i++)
+                            mem.WriteVar(b + i, ((mk >> i) & 1));
+                        lastWritten[s - 1] = mk;
+                    }
+                    haveWritten = true;
+                    AppliedFrame = 0;
+                    FrameLag = 0;
                 }
             }
         }
@@ -346,6 +529,7 @@ namespace LvKSync
         private readonly Label _netLine = new Label();
         private readonly TextBox _log = new TextBox();
         private readonly WinTimer _timer = new WinTimer();
+        private FileLogger _file;
 
         private long _lastTx, _lastRx;
 
@@ -364,6 +548,7 @@ namespace LvKSync
             BuildLayout();
             LoadSettings();
 
+            _file = new FileLogger("LvKSyncClient");
             _engine.Log += delegate (string s) { Post(delegate { AppendLog(s); }); };
             _engine.Changed += delegate { Post(RefreshAll); };
 
@@ -583,6 +768,7 @@ namespace LvKSync
         {
             if (_log.TextLength > 60000) _log.Clear();
             _log.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + s + Environment.NewLine);
+            if (_file != null) _file.Write(s);
         }
 
         private void OnToggle(object sender, EventArgs e)
@@ -723,6 +909,7 @@ namespace LvKSync
             _timer.Stop();
             SaveSettings();
             if (_engine.Running) _engine.Stop();
+            if (_file != null) { _file.Dispose(); _file = null; }
             base.OnFormClosing(e);
         }
 
@@ -763,6 +950,7 @@ namespace LvKSync
                         if (nx != null) { _keyMode.SelectedIndex = 5; _keys.Text = nx; i++; }
                         break;
                     case "--apply-own": _applyOwn.Checked = true; break;
+                    case "--throttle": _engine.ThrottleAhead = true; break;
                 }
             }
             SyncKeyBox();
