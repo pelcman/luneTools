@@ -4,7 +4,7 @@
 // ゲームのネットワーク入力ブロックへ書き込む。
 //
 // ゲーム側との取り決め:
-//   V[netbase + (slot-1)*6 + 0..5] = 上, 下, 左, 右, A, B   (各 0 か 1)
+//   V[netbase + (slot-1)*6 + 0..5] = 左, 上, 下, 右, A, B   (各 0 か 1)
 //   リモートのプレイヤー N については、ゲーム側で 3014 の代わりに
 //   V[321..326] へこの6個をコピーする。変数配列の操作(03013)なら1コマンドで済む。
 
@@ -28,6 +28,7 @@ namespace LvKSync
         private static int _mySlot;
         private static volatile int _rttMs = -1;
         private static int _mySlotWanted;
+        private static volatile string[] _roster = new string[Proto.MaxPlayers + 1];
         private static readonly Stopwatch _clock = Stopwatch.StartNew();
 
         private static void Usage()
@@ -39,11 +40,12 @@ namespace LvKSync
             Console.WriteLine();
             Console.WriteLine("  --host <ip>        サーバーのIP (既定 127.0.0.1)");
             Console.WriteLine("  --port <n>         ポート (既定 47801)");
+            Console.WriteLine("  --name <名前>      サーバーに表示される名前");
             Console.WriteLine("  --slot <1-4>       希望するプレイヤー番号 (0 = おまかせ)");
             Console.WriteLine("  --netbase <n>      ネットワーク入力ブロックの先頭変数 (既定 9001)");
             Console.WriteLine("  --source <s>       ローカル入力の取得元  keys | netvar  (既定 keys)");
-            Console.WriteLine("  --local-keys <s>   source=keys のときの割り当て 上,下,左,右,A,B");
-            Console.WriteLine("                     (既定 W,S,A,D,F,G)");
+            Console.WriteLine("  --local-keys <s>   source=keys のときの割り当て 左,上,下,右,A,B");
+            Console.WriteLine("                     (既定 A,W,S,D,F,G)");
             Console.WriteLine("  --pid <n>          対象プロセスID (省略時は自動検出)");
             Console.WriteLine("  --index <n>        RPG_RT が複数あるとき何番目か (既定 0)");
             Console.WriteLine("  --delay <n>        入力遅延フレーム数 (既定 2)。回線が悪いほど大きく");
@@ -71,12 +73,15 @@ namespace LvKSync
             sb.AppendLine("[network]");
             sb.AppendLine("host = 127.0.0.1");
             sb.AppendLine("port = 47801");
+            sb.AppendLine("# サーバーに表示される名前");
+            sb.AppendLine("name = ");
+            sb.AppendLine();
             sb.AppendLine("# 希望するプレイヤー番号。0 ならサーバーにおまかせ。");
             sb.AppendLine("slot = 0");
             sb.AppendLine();
             sb.AppendLine("[game]");
             sb.AppendLine("# ネットワーク入力ブロックの先頭変数番号。");
-            sb.AppendLine("# V[netbase + (slot-1)*6 + 0..5] = 上,下,左,右,A,B");
+            sb.AppendLine("# V[netbase + (slot-1)*6 + 0..5] = 左,上,下,右,A,B");
             sb.AppendLine("# プロジェクトで未使用の連続24変数を割り当ててください。");
             sb.AppendLine("netbase = 9001");
             sb.AppendLine();
@@ -84,7 +89,7 @@ namespace LvKSync
             sb.AppendLine("#   keys   … OSのキーボード状態を直接読む (ゲーム側の改造なしで動く)");
             sb.AppendLine("#   netvar … ゲームが自分のスロットの入力を netbase へ書く前提で読む");
             sb.AppendLine("source = keys");
-            sb.AppendLine("localkeys = W,S,A,D,F,G");
+            sb.AppendLine("localkeys = A,W,S,D,F,G");
             sb.AppendLine();
             sb.AppendLine("# 0 なら RPG_RT.exe を自動検出。複数あるときは index で選ぶ。");
             sb.AppendLine("pid = 0");
@@ -116,9 +121,10 @@ namespace LvKSync
             string host = ini.Get("host", "127.0.0.1");
             int port = ini.GetInt("port", 47801);
             int slot = ini.GetInt("slot", 0);
+            string myName = ini.Get("name", Environment.UserName);
             int netbase = ini.GetInt("netbase", 9001);
             string source = ini.Get("source", "keys").ToLowerInvariant();
-            string localKeys = ini.Get("localkeys", "W,S,A,D,F,G");
+            string localKeys = ini.Get("localkeys", "A,W,S,D,F,G");
             int pid = ini.GetInt("pid", 0);
             int index = ini.GetInt("index", 0);
             bool noWrite = ini.GetBool("nowrite", false);
@@ -141,6 +147,7 @@ namespace LvKSync
                     case "--list": listOnly = true; break;
                     case "--host": if (nx != null) { host = nx; i++; } break;
                     case "--port": if (nx != null) { int.TryParse(nx, out port); i++; } break;
+                    case "--name": if (nx != null) { myName = nx; i++; } break;
                     case "--slot": if (nx != null) { int.TryParse(nx, out slot); i++; } break;
                     case "--netbase": if (nx != null) { int.TryParse(nx, out netbase); i++; } break;
                     case "--source": if (nx != null) { source = nx.ToLowerInvariant(); i++; } break;
@@ -182,6 +189,7 @@ namespace LvKSync
 
             Console.WriteLine("=== LvKSyncClient ===");
             Console.WriteLine("  サーバー   : {0}:{1}", host, port);
+            Console.WriteLine("  名前       : {0}", myName);
             Console.WriteLine("  希望スロット: {0}", slot == 0 ? "おまかせ" : slot.ToString());
             Console.WriteLine("  入力ブロック: V[{0}..{1}]  (1人6変数 x 4人)", netbase, netbase + Proto.MaxPlayers * Buttons - 1);
             Console.WriteLine("  ローカル入力: {0}{1}", source, source == "keys" ? " (" + localKeys + ")" : "");
@@ -260,7 +268,8 @@ namespace LvKSync
             tcp.NoDelay = true;
             var st = tcp.GetStream();
 
-            var hello = Proto.Build(Proto.MsgHello, new byte[] { (byte)Math.Max(0, Math.Min(Proto.MaxPlayers, slot)) });
+            var hello = Proto.Build(Proto.MsgHello,
+                Proto.HelloPayload(Math.Max(0, Math.Min(Proto.MaxPlayers, slot)), myName));
             st.Write(hello, 0, hello.Length);
 
             byte type; byte[] payload;
@@ -320,6 +329,14 @@ namespace LvKSync
                     _remoteMasks = m;
                     _connectedBits = p[4 + Proto.MaxPlayers * 2];
                     _rxCount++;
+                }
+                else if (type == Proto.MsgRoster)
+                {
+                    _roster = Proto.ParseRoster(p);
+                    var sb = new StringBuilder("座席: ");
+                    for (int i = 1; i <= Proto.MaxPlayers; i++)
+                        sb.AppendFormat("P{0}[{1}]  ", i, _roster[i] == null ? "空き" : _roster[i]);
+                    Console.WriteLine(sb.ToString());
                 }
                 else if (type == Proto.MsgPong && p.Length >= 8)
                 {
@@ -472,7 +489,7 @@ namespace LvKSync
 
         private static string MaskText(ushort m)
         {
-            const string names = "UDLRAB";
+            const string names = "LUDRAB";
             var c = new char[6];
             for (int i = 0; i < 6; i++) c[i] = ((m >> i) & 1) != 0 ? names[i] : '.';
             return new string(c);

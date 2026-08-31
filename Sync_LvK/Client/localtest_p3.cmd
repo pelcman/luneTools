@@ -16,5 +16,5 @@ echo   ※ ゲームを 3 つ以上起動しておく必要があります。
 echo      起動が古い順に 1番目, 2番目 ... と数えます。
 echo.
 pause
-"%~dp0bin\LvKSyncClient.exe" --host 127.0.0.1 --port 47801 --slot 3 --index 2 --local-keys S,F,D,A,G,H
+"%~dp0bin\LvKSyncClient.exe" --host 127.0.0.1 --port 47801 --slot 3 --index 2 --local-keys D,S,F,A,G,H
 pause

@@ -49,7 +49,7 @@ echo.
 echo   %HOST%:%PORT% Ç…ê⁄ë±ÇµÇ‹Ç∑...
 echo.
 
-"%~dp0bin\LvKSyncClient.exe" --host %HOST% --port %PORT% --slot 1 --index 0 --local-keys Up,Down,Left,Right,Z,X
+"%~dp0bin\LvKSyncClient.exe" --host %HOST% --port %PORT% --slot 1 --index 0 --local-keys Left,Up,Down,Right,Z,X
 
 echo.
 echo èIóπÇµÇ‹ÇµÇΩÅB

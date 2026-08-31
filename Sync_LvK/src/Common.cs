@@ -339,6 +339,9 @@ namespace LvKSync
         public const byte MsgFull = 6;     // S->C  空きスロットなし
         public const byte MsgPing = 7;     // C->S  [stamp 8]  往復時間の測定
         public const byte MsgPong = 8;     // S->C  [stamp 8]  そのまま返す
+        public const byte MsgRoster = 9;   // S->C  誰が何Pに座っているか
+
+        public const int MaxNameBytes = 24;
 
         public static byte[] Build(byte type, byte[] payload)
         {
@@ -391,6 +394,84 @@ namespace LvKSync
         public static byte[] StampPayload(long stamp)
         {
             return BitConverter.GetBytes(stamp);
+        }
+
+        /// <summary>参加要求。希望スロットと表示名を送る。</summary>
+        public static byte[] HelloPayload(int slot, string name)
+        {
+            var nb = TrimName(name);
+            var p = new byte[2 + nb.Length];
+            p[0] = (byte)slot;
+            p[1] = (byte)nb.Length;
+            Buffer.BlockCopy(nb, 0, p, 2, nb.Length);
+            return p;
+        }
+
+        public static void ParseHello(byte[] p, out int slot, out string name)
+        {
+            slot = p.Length > 0 ? p[0] : 0;
+            name = "";
+            if (p.Length > 1)
+            {
+                int n = p[1];
+                if (n > 0 && p.Length >= 2 + n)
+                    name = Encoding.UTF8.GetString(p, 2, n);
+            }
+        }
+
+        /// <summary>座席表。空きスロットは名前なしで含めない。</summary>
+        public static byte[] RosterPayload(string[] namesBySlot)
+        {
+            var parts = new System.Collections.Generic.List<byte[]>();
+            int count = 0;
+            for (int i = 1; i <= MaxPlayers; i++)
+            {
+                if (namesBySlot[i] == null) continue;
+                var nb = TrimName(namesBySlot[i]);
+                var e = new byte[2 + nb.Length];
+                e[0] = (byte)i;
+                e[1] = (byte)nb.Length;
+                Buffer.BlockCopy(nb, 0, e, 2, nb.Length);
+                parts.Add(e);
+                count++;
+            }
+            int total = 1;
+            foreach (var e in parts) total += e.Length;
+            var p = new byte[total];
+            p[0] = (byte)count;
+            int off = 1;
+            foreach (var e in parts) { Buffer.BlockCopy(e, 0, p, off, e.Length); off += e.Length; }
+            return p;
+        }
+
+        public static string[] ParseRoster(byte[] p)
+        {
+            var names = new string[MaxPlayers + 1];
+            if (p.Length < 1) return names;
+            int count = p[0], off = 1;
+            for (int i = 0; i < count && off + 2 <= p.Length; i++)
+            {
+                int slot = p[off], n = p[off + 1];
+                off += 2;
+                if (off + n > p.Length) break;
+                if (slot >= 1 && slot <= MaxPlayers)
+                    names[slot] = Encoding.UTF8.GetString(p, off, n);
+                off += n;
+            }
+            return names;
+        }
+
+        private static byte[] TrimName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) name = "";
+            var b = Encoding.UTF8.GetBytes(name);
+            if (b.Length <= MaxNameBytes) return b;
+            // UTF8 の途中で切らないように縮める
+            int len = MaxNameBytes;
+            while (len > 0 && (b[len] & 0xC0) == 0x80) len--;
+            var t = new byte[len];
+            Buffer.BlockCopy(b, 0, t, 0, len);
+            return t;
         }
 
         public static byte[] FramePayload(int frame, ushort[] masks, byte connected)

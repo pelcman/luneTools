@@ -25,6 +25,7 @@ namespace LvKSync
             public int Frame;
             public long LastSeenMs;
             public string Remote;
+            public string Name;
             public long RxCount;
         }
 
@@ -184,9 +185,12 @@ namespace LvKSync
                 return;
             }
 
-            int want = payload.Length > 0 ? payload[0] : 0;
+            int want; string pname;
+            Proto.ParseHello(payload, out want, out pname);
+            if (string.IsNullOrEmpty(pname)) pname = "(名前なし)";
             var peer = new Peer();
-            peer.Tcp = tcp; peer.Stream = st; peer.Remote = remote; peer.LastSeenMs = Clock.ElapsedMilliseconds;
+            peer.Tcp = tcp; peer.Stream = st; peer.Remote = remote; peer.Name = pname;
+            peer.LastSeenMs = Clock.ElapsedMilliseconds;
 
             int assigned = 0;
             lock (Gate)
@@ -208,7 +212,8 @@ namespace LvKSync
 
             try { st.Write(Proto.Build(Proto.MsgWelcome, new byte[] { (byte)assigned, (byte)maxPlayers }), 0, 8); }
             catch { }
-            Console.WriteLine("[接続] P{0} <- {1}", assigned, remote);
+            Console.WriteLine("[接続] P{0}  {1}  <- {2}", assigned, pname, remote);
+            BroadcastRoster();
 
             while (!_stop)
             {
@@ -230,7 +235,24 @@ namespace LvKSync
 
             lock (Gate) { if (Slots[peer.Slot] == peer) Slots[peer.Slot] = null; }
             try { tcp.Close(); } catch { }
-            Console.WriteLine("[切断] P{0} ({1})", peer.Slot, remote);
+            Console.WriteLine("[切断] P{0}  {1}  ({2})", peer.Slot, peer.Name, remote);
+            BroadcastRoster();
+        }
+
+        /// <summary>座席表を全員へ配る。誰が何Pに座っているかを共有する。</summary>
+        private static void BroadcastRoster()
+        {
+            var names = new string[Proto.MaxPlayers + 1];
+            lock (Gate)
+                for (int i = 1; i <= Proto.MaxPlayers; i++)
+                    if (Slots[i] != null) names[i] = Slots[i].Name;
+            var pkt = Proto.Build(Proto.MsgRoster, Proto.RosterPayload(names));
+            lock (Gate)
+                for (int i = 1; i <= Proto.MaxPlayers; i++)
+                {
+                    if (Slots[i] == null) continue;
+                    try { Slots[i].Stream.Write(pkt, 0, pkt.Length); } catch { }
+                }
         }
 
         private static void BroadcastLoop()
@@ -286,7 +308,7 @@ namespace LvKSync
                         {
                             var p = Slots[i];
                             if (p == null) { sb.AppendFormat("P{0}:--       ", i); continue; }
-                            sb.AppendFormat("P{0}:{1} {2,3}/s  ", i, MaskText(p.Mask), p.RxCount - lastRx[i]);
+                            sb.AppendFormat("P{0}[{1}]:{2} {3,3}/s  ", i, p.Name, MaskText(p.Mask), p.RxCount - lastRx[i]);
                             lastRx[i] = p.RxCount;
                         }
                     }
@@ -300,7 +322,7 @@ namespace LvKSync
         /// <summary>ボタン状態を見やすい6文字にする。</summary>
         private static string MaskText(ushort m)
         {
-            const string names = "UDLRAB";
+            const string names = "LUDRAB";
             var c = new char[6];
             for (int i = 0; i < 6; i++) c[i] = ((m >> i) & 1) != 0 ? names[i] : '.';
             return new string(c);

@@ -1,5 +1,7 @@
 # 実行時に自動生成される設定ファイル
 SyncLvK.ini
+LvKSyncClient.ini
+LvKSyncServer.ini
 
 # ビルド中間物
 *.pdb
@@ -7,10 +9,6 @@ SyncLvK.ini
 *.suo
 *.user
 obj/
-
-# 本体
-LvK/
-LvK2/
 
 # キャプチャやログ
 *.log
