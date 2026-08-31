@@ -44,6 +44,8 @@ namespace LvKSync
             Console.WriteLine("  --pid <n>          対象プロセスID (省略時は自動検出)");
             Console.WriteLine("  --index <n>        RPG_RT が複数あるとき何番目か (既定 0)");
             Console.WriteLine("  --no-write         受信しても書き込まない (動作確認用)");
+            Console.WriteLine("  --no-ptr           ポインタ方式を使わず走査で探す (保険)");
+            Console.WriteLine("  --varbase <hex>    変数配列の位置を手動指定する");
             Console.WriteLine("  --apply-own        自分のスロットにも書き込む (通常は不要)");
             Console.WriteLine("  --config <path>    設定ファイル (既定 LvKSyncClient.ini)");
             Console.WriteLine("  --list             起動中の RPG_RT を一覧表示して終了");
@@ -109,6 +111,10 @@ namespace LvKSync
             int index = ini.GetInt("index", 0);
             bool noWrite = ini.GetBool("nowrite", false);
             bool applyOwn = ini.GetBool("applyown", false);
+            bool noPtr = ini.GetBool("noptr", false);
+            long varbaseOverride = 0;
+            string vbs = ini.Get("varbase", null);
+            if (!string.IsNullOrEmpty(vbs)) { try { varbaseOverride = Convert.ToInt64(vbs, 16); } catch { } }
             bool listOnly = false;
 
             for (int i = 0; i < argv.Length; i++)
@@ -128,6 +134,8 @@ namespace LvKSync
                     case "--pid": if (nx != null) { int.TryParse(nx, out pid); i++; } break;
                     case "--index": if (nx != null) { int.TryParse(nx, out index); i++; } break;
                     case "--no-write": noWrite = true; break;
+                    case "--no-ptr": noPtr = true; break;
+                    case "--varbase": if (nx != null) { try { varbaseOverride = Convert.ToInt64(nx, 16); } catch { } i++; } break;
                     case "--apply-own": applyOwn = true; break;
                     case "--config": i++; break;
                 }
@@ -181,12 +189,24 @@ namespace LvKSync
             try { mem = new GameMemory(pid); }
             catch (Exception ex) { Console.WriteLine(ex.Message); return 3; }
 
-            Console.WriteLine("変数配列を探しています… ゲームを対戦画面まで進めてください。");
+            int needIndex = netbase + Proto.MaxPlayers * Buttons - 1;
+            if (needIndex < VarBaseFinder.TickVar) needIndex = VarBaseFinder.TickVar;
             long vb = 0; string method = null;
-            while (vb == 0 && !_stop)
+            if (varbaseOverride != 0) { vb = varbaseOverride; method = "手動指定"; }
+            else
             {
-                vb = VarBaseFinder.Find(mem, out method);
-                if (vb == 0) { Console.Write("."); Thread.Sleep(600); }
+                Console.WriteLine("ゲームのデータを探しています…");
+                for (int tries = 0; vb == 0 && !_stop; tries++)
+                {
+                    vb = noPtr ? VarBaseFinder.FindBySignature(mem, out method)
+                               : VarBaseFinder.Find(mem, needIndex, out method);
+                    if (vb == 0)
+                    {
+                        if (tries == 3) Console.WriteLine("  見つかりません。ゲームを対戦画面まで進めてみてください。");
+                        Console.Write("."); Thread.Sleep(600);
+                    }
+                }
+                Console.WriteLine();
             }
             Console.WriteLine();
             mem.VarBase = vb;
@@ -237,7 +257,8 @@ namespace LvKSync
             rx.IsBackground = true;
             rx.Start();
 
-            MainLoop(mem, st, netbase, source, keys, noWrite, applyOwn);
+            MainLoop(mem, st, netbase, source, keys, noWrite, applyOwn,
+                     (varbaseOverride == 0 && !noPtr) ? needIndex : -1);
 
             _stop = true;
             try { var bye = Proto.Build(Proto.MsgBye, null); st.Write(bye, 0, bye.Length); } catch { }
@@ -267,9 +288,10 @@ namespace LvKSync
         }
 
         private static void MainLoop(GameMemory mem, NetworkStream st, int netbase,
-            string source, int[] keys, bool noWrite, bool applyOwn)
+            string source, int[] keys, bool noWrite, bool applyOwn, int trackIndex)
         {
             int lastTick = -1;
+            int refreshCounter = 0;
             long statusNext = 1000;
             long lastTx = 0, lastRx = 0;
             var sw = Stopwatch.StartNew();
@@ -278,6 +300,14 @@ namespace LvKSync
             while (!_stop)
             {
                 if (!mem.Alive) { Console.WriteLine("ゲームが終了しました。"); break; }
+
+                // 対戦の開始・終了で変数配列は作り直される。追従する。
+                if (trackIndex >= 0 && ++refreshCounter >= 200)
+                {
+                    refreshCounter = 0;
+                    if (VarBaseFinder.Refresh(mem, trackIndex))
+                        Console.WriteLine("変数配列が作り直されました。追従します: 0x{0:X}", mem.VarBase);
+                }
 
                 int tick = mem.ReadVar(VarBaseFinder.TickVar);
 

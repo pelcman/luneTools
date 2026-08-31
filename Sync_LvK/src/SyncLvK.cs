@@ -114,6 +114,19 @@ namespace SyncLvK
             return Native.ReadProcessMemory(_h, (IntPtr)addr, buf, size, out got) && got == size;
         }
 
+        public bool QueryRegion(long addr, out long regionEnd)
+        {
+            regionEnd = 0;
+            Native.MEMORY_BASIC_INFORMATION mbi;
+            if (Native.VirtualQueryEx(_h, (IntPtr)addr, out mbi,
+                    Marshal.SizeOf(typeof(Native.MEMORY_BASIC_INFORMATION))) == 0) return false;
+            uint pr = mbi.Protect & 0xFF;
+            bool writable = (pr == 0x04 || pr == 0x40 || pr == 0x08 || pr == 0x80);
+            if (mbi.State != Native.MEM_COMMIT || !writable || (mbi.Protect & Native.PAGE_GUARD) != 0) return false;
+            regionEnd = (long)mbi.BaseAddress + (long)mbi.RegionSize;
+            return true;
+        }
+
         internal sealed class Region { public long Base; public int Size; public byte[] Data; }
 
         /// <summary>書き込み可能なコミット済み領域を列挙する。</summary>
@@ -177,7 +190,53 @@ namespace SyncLvK
         private static readonly int[] AntiIdx = { 20000, 20003, 20200, 20203 };
         public const int TickVar = 654;
 
-        public static long Find(GameMemory mem, out string method)
+        public const long ModulePtrOffset = 0x275528;
+
+        /// <summary>オフセットを実測したランタイムの大きさ。違う版ならポインタ方式は使わない。</summary>
+        public const int ExpectedModuleSize = 0x292000;
+
+        /// <summary>モジュール内のポインタから変数配列を得る。対戦前の画面でも成立する。</summary>
+        public static long FromModulePointer(GameMemory mem, int needIndex)
+        {
+            long modBase = 0; int modSize = 0;
+            try
+            {
+                var pr = System.Diagnostics.Process.GetProcessById(mem.Pid);
+                foreach (System.Diagnostics.ProcessModule m in pr.Modules)
+                    if (m.ModuleName.Equals("RPG_RT.exe", StringComparison.OrdinalIgnoreCase))
+                    { modBase = (long)m.BaseAddress; modSize = m.ModuleMemorySize; break; }
+            }
+            catch { }
+            if (modBase == 0 || modSize != ExpectedModuleSize) return 0;   // 別バージョンのランタイム
+            if (ModulePtrOffset + 8 > modSize) return 0;
+            var buf = new byte[8];
+            if (!mem.ReadRaw(modBase + ModulePtrOffset, buf, 8)) return 0;
+            long vb = BitConverter.ToInt64(buf, 0);
+            if (vb < 0x10000 || vb > 0x7FFFFFFFFFFF || (vb & 3) != 0) return 0;
+            long end;
+            if (!mem.QueryRegion(vb, out end)) return 0;
+            if (end < vb + ((long)needIndex + 1) * 4) return 0;
+            var b4 = new byte[4];
+            if (!mem.ReadRaw(vb, b4, 4)) return 0;
+            return vb;
+        }
+
+        public static long Find(GameMemory mem, int needIndex, out string method)
+        {
+            long p = FromModulePointer(mem, needIndex);
+            if (p != 0) { method = "module-pointer"; return p; }
+            return FindBySignature(mem, out method);
+        }
+
+        public static bool Refresh(GameMemory mem, int needIndex)
+        {
+            long p = FromModulePointer(mem, needIndex);
+            if (p == 0 || p == mem.VarBase) return false;
+            mem.SetVarBase(p);
+            return true;
+        }
+
+        public static long FindBySignature(GameMemory mem, out string method)
         {
             method = null;
             var regs = mem.Snapshot(true);
@@ -507,13 +566,20 @@ namespace SyncLvK
             catch (Exception ex) { Console.WriteLine(ex.Message); return 3; }
 
             // --- 変数配列のベースを探す（対戦画面に入るまで見つからない） ---
-            Console.WriteLine("変数配列を探しています… ゲームを対戦画面まで進めてください。");
+            int needIdx = VarBaseFinder.TickVar;
+            foreach (var v in sendVars) if (v > needIdx) needIdx = v;
+            foreach (var v in recvVars) if (v > needIdx) needIdx = v;
+            Console.WriteLine("ゲームのデータを探しています…");
             long vb = 0;
             string method = null;
-            while (vb == 0)
+            for (int tries = 0; vb == 0; tries++)
             {
-                vb = VarBaseFinder.Find(mem, out method);
-                if (vb == 0) { Console.Write("."); Thread.Sleep(600); }
+                vb = VarBaseFinder.Find(mem, needIdx, out method);
+                if (vb == 0)
+                {
+                    if (tries == 3) Console.WriteLine("  見つかりません。ゲームを対戦画面まで進めてみてください。");
+                    Console.Write("."); Thread.Sleep(600);
+                }
             }
             Console.WriteLine();
             mem.SetVarBase(vb);
@@ -559,7 +625,7 @@ namespace SyncLvK
             Console.WriteLine("Ctrl+C で終了します。");
             Console.WriteLine();
 
-            var session = new Session(mem, stream, sendVars, recvVars, cfg);
+            var session = new Session(mem, stream, sendVars, recvVars, cfg, needIdx);
             session.Run();
 
             try { if (client != null) client.Close(); } catch { }
@@ -581,9 +647,11 @@ namespace SyncLvK
             private long _recvCount, _sendCount, _applyCount;
             private volatile bool _stop;
 
-            public Session(GameMemory mem, NetworkStream stream, int[] sendVars, int[] recvVars, Config cfg)
+            private readonly int _trackIndex;
+
+            public Session(GameMemory mem, NetworkStream stream, int[] sendVars, int[] recvVars, Config cfg, int trackIndex)
             {
-                _mem = mem; _stream = stream; _sendVars = sendVars; _recvVars = recvVars; _cfg = cfg;
+                _mem = mem; _stream = stream; _sendVars = sendVars; _recvVars = recvVars; _cfg = cfg; _trackIndex = trackIndex;
             }
 
             public void Run()
@@ -605,8 +673,15 @@ namespace SyncLvK
                 int lastTick = -1;
                 long lastSend = 0, lastRecv = 0, lastApply = 0;
 
+                int refreshCounter = 0;
                 while (!_stop)
                 {
+                    if (++refreshCounter >= 200)
+                    {
+                        refreshCounter = 0;
+                        if (VarBaseFinder.Refresh(_mem, _trackIndex))
+                            Console.WriteLine("変数配列が作り直されました。追従します: 0x{0:X}", _mem.VarBase);
+                    }
                     int tick = _mem.ReadVar(VarBaseFinder.TickVar);
 
                     // 送信は1フレームにつき1回

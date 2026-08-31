@@ -103,6 +103,34 @@ namespace LvKSync
             for (int i = 0; i < idx.Length; i++) WriteVar(idx[i], src[i]);
         }
 
+        /// <summary>そのアドレスが書き込み可能なコミット済み領域か、何バイト連続しているかを返す。</summary>
+        public bool QueryRegion(long addr, out long regionEnd)
+        {
+            regionEnd = 0;
+            Native.MEMORY_BASIC_INFORMATION mbi;
+            if (Native.VirtualQueryEx(_h, (IntPtr)addr, out mbi,
+                    Marshal.SizeOf(typeof(Native.MEMORY_BASIC_INFORMATION))) == 0) return false;
+            uint pr = mbi.Protect & 0xFF;
+            bool writable = (pr == 0x04 || pr == 0x40 || pr == 0x08 || pr == 0x80);
+            if (mbi.State != Native.MEM_COMMIT || !writable || (mbi.Protect & Native.PAGE_GUARD) != 0) return false;
+            regionEnd = (long)mbi.BaseAddress + (long)mbi.RegionSize;
+            return true;
+        }
+
+        public long ModuleBase(string name, out int size)
+        {
+            size = 0;
+            try
+            {
+                var p = Process.GetProcessById(Pid);
+                foreach (ProcessModule m in p.Modules)
+                    if (m.ModuleName.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    { size = m.ModuleMemorySize; return (long)m.BaseAddress; }
+            }
+            catch { }
+            return 0;
+        }
+
         public bool ReadRaw(long addr, byte[] buf, int size)
         {
             int got;
@@ -170,11 +198,76 @@ namespace LvKSync
     public static class VarBaseFinder
     {
         public const int TickVar = 654;
+
+        /// <summary>
+        /// RPG_RT.exe 内の、変数配列を指すポインタの位置。
+        /// Maniacs v250823 / 64bit で実測した値。ランタイムが変わるとずれるので、
+        /// 検証に失敗したらシグネチャ走査に切り替える。
+        /// </summary>
+        public const long ModulePtrOffset = 0x275528;
+
+        /// <summary>オフセットを実測したランタイムの大きさ。違う版ならポインタ方式は使わない。</summary>
+        public const int ExpectedModuleSize = 0x292000;
+
+        /// <summary>
+        /// モジュール内のポインタから変数配列を得る。
+        /// シグネチャ走査と違い、対戦中でなくても（キャラクター選択画面でも）成立する。
+        /// needIndex は触る予定の最大の変数番号。領域がそこまで届くかを検証する。
+        /// </summary>
+        public static long FromModulePointer(GameMemory mem, int needIndex)
+        {
+            int modSize;
+            long modBase = mem.ModuleBase("RPG_RT.exe", out modSize);
+            if (modBase == 0) return 0;
+            if (modSize != ExpectedModuleSize) return 0;   // 別バージョンのランタイム
+            if (ModulePtrOffset + 8 > modSize) return 0;
+
+            var buf = new byte[8];
+            if (!mem.ReadRaw(modBase + ModulePtrOffset, buf, 8)) return 0;
+            long vb = BitConverter.ToInt64(buf, 0);
+
+            // ユーザーモードのヒープらしいアドレスか
+            if (vb < 0x10000 || vb > 0x7FFFFFFFFFFF) return 0;
+            if ((vb & 3) != 0) return 0;
+
+            // 触る範囲が書き込み可能な領域に収まっているか
+            long need = vb + ((long)needIndex + 1) * 4;
+            long end;
+            if (!mem.QueryRegion(vb, out end)) return 0;
+            if (end < need) return 0;
+
+            var b4 = new byte[4];
+            if (!mem.ReadRaw(vb, b4, 4)) return 0;
+            return vb;
+        }
         private const int Sentinel = -999999999;
         private static readonly int[] SentinelIdx = { 20001, 20002, 20201, 20202, 20401, 20402, 20601, 20602 };
         private static readonly int[] AntiIdx = { 20000, 20003, 20200, 20203 };
 
-        public static long Find(GameMemory mem, out string method)
+        /// <summary>
+        /// ポインタ方式を先に試し、駄目ならシグネチャ走査に落とす。
+        /// ポインタ方式は対戦前の画面でも成立する。
+        /// </summary>
+        public static long Find(GameMemory mem, int needIndex, out string method)
+        {
+            long p = FromModulePointer(mem, needIndex);
+            if (p != 0) { method = "module-pointer"; return p; }
+            return FindBySignature(mem, out method);
+        }
+
+        /// <summary>
+        /// ポインタを読み直して、変数配列が作り直されていたら追従する。
+        /// 対戦の開始・終了で配列は再確保されるため、掴みっぱなしにはできない。
+        /// </summary>
+        public static bool Refresh(GameMemory mem, int needIndex)
+        {
+            long p = FromModulePointer(mem, needIndex);
+            if (p == 0 || p == mem.VarBase) return false;
+            mem.VarBase = p;
+            return true;
+        }
+
+        public static long FindBySignature(GameMemory mem, out string method)
         {
             method = null;
             var regs = mem.Snapshot(true);
