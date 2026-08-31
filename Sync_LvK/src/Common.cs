@@ -337,6 +337,8 @@ namespace LvKSync
         public const byte MsgFrame = 4;    // S->C  [frame 4][mask 2 x4][connected 1]
         public const byte MsgBye = 5;      // 双方向
         public const byte MsgFull = 6;     // S->C  空きスロットなし
+        public const byte MsgPing = 7;     // C->S  [stamp 8]  往復時間の測定
+        public const byte MsgPong = 8;     // S->C  [stamp 8]  そのまま返す
 
         public static byte[] Build(byte type, byte[] payload)
         {
@@ -384,6 +386,11 @@ namespace LvKSync
             Buffer.BlockCopy(BitConverter.GetBytes(frame), 0, p, 1, 4);
             Buffer.BlockCopy(BitConverter.GetBytes(mask), 0, p, 5, 2);
             return p;
+        }
+
+        public static byte[] StampPayload(long stamp)
+        {
+            return BitConverter.GetBytes(stamp);
         }
 
         public static byte[] FramePayload(int frame, ushort[] masks, byte connected)

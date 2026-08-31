@@ -220,6 +220,11 @@ namespace LvKSync
                     peer.Mask = BitConverter.ToUInt16(payload, 5);
                     peer.RxCount++;
                 }
+                else if (type == Proto.MsgPing && payload.Length >= 8)
+                {
+                    var pong = Proto.Build(Proto.MsgPong, payload);
+                    try { st.Write(pong, 0, pong.Length); } catch { break; }
+                }
                 else if (type == Proto.MsgBye) break;
             }
 
