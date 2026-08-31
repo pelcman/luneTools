@@ -47,6 +47,7 @@ namespace LvKSync
             Console.WriteLine("  --pid <n>          対象プロセスID (省略時は自動検出)");
             Console.WriteLine("  --index <n>        RPG_RT が複数あるとき何番目か (既定 0)");
             Console.WriteLine("  --delay <n>        入力遅延フレーム数 (既定 2)。回線が悪いほど大きく");
+            Console.WriteLine("  --show-net         ゲームのメモリ上の入力ブロックを表示 (確認用)");
             Console.WriteLine("  --no-write         受信しても書き込まない (動作確認用)");
             Console.WriteLine("  --no-ptr           ポインタ方式を使わず走査で探す (保険)");
             Console.WriteLine("  --varbase <hex>    変数配列の位置を手動指定する");
@@ -95,6 +96,8 @@ namespace LvKSync
             sb.AppendLine("delay = 2");
             sb.AppendLine();
             sb.AppendLine("[misc]");
+            sb.AppendLine("# ゲームのメモリ上の入力ブロックを表示する (確認用)");
+            sb.AppendLine("shownet = false");
             sb.AppendLine("nowrite = false");
             sb.AppendLine("applyown = false");
             File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
@@ -121,6 +124,7 @@ namespace LvKSync
             bool noWrite = ini.GetBool("nowrite", false);
             bool applyOwn = ini.GetBool("applyown", false);
             int delayFrames = ini.GetInt("delay", 2);
+            bool showNet = ini.GetBool("shownet", false);
             bool noPtr = ini.GetBool("noptr", false);
             long varbaseOverride = 0;
             string vbs = ini.Get("varbase", null);
@@ -145,6 +149,7 @@ namespace LvKSync
                     case "--index": if (nx != null) { int.TryParse(nx, out index); i++; } break;
                     case "--no-write": noWrite = true; break;
                     case "--delay": if (nx != null) { int.TryParse(nx, out delayFrames); i++; } break;
+                    case "--show-net": showNet = true; break;
                     case "--no-ptr": noPtr = true; break;
                     case "--varbase": if (nx != null) { try { varbaseOverride = Convert.ToInt64(nx, 16); } catch { } i++; } break;
                     case "--apply-own": applyOwn = true; break;
@@ -291,7 +296,7 @@ namespace LvKSync
             ping.Start();
 
             MainLoop(mem, st, netbase, source, keys, noWrite, applyOwn,
-                     (varbaseOverride == 0 && !noPtr) ? needIndex : -1, delayFrames);
+                     (varbaseOverride == 0 && !noPtr) ? needIndex : -1, delayFrames, showNet);
 
             _stop = true;
             try { var bye = Proto.Build(Proto.MsgBye, null); st.Write(bye, 0, bye.Length); } catch { }
@@ -352,7 +357,7 @@ namespace LvKSync
         }
 
         private static void MainLoop(GameMemory mem, NetworkStream st, int netbase,
-            string source, int[] keys, bool noWrite, bool applyOwn, int trackIndex, int delayFrames)
+            string source, int[] keys, bool noWrite, bool applyOwn, int trackIndex, int delayFrames, bool showNet)
         {
             int refreshCounter = 0;
             long localFrame = 0;
@@ -446,6 +451,19 @@ namespace LvKSync
                         sb.AppendFormat("{0}{1}:{2} ", s == _mySlot ? "*" : " ", s, on ? MaskText(m[s - 1]) : "------");
                     }
                     Console.WriteLine(sb.ToString());
+                    if (showNet)
+                    {
+                        var nb = new StringBuilder("      ゲームのメモリ V[");
+                        nb.Append(netbase).Append("..").Append(netbase + Proto.MaxPlayers * Buttons - 1).Append("] = ");
+                        for (int s2 = 1; s2 <= Proto.MaxPlayers; s2++)
+                        {
+                            int b2 = netbase + (s2 - 1) * Buttons;
+                            nb.Append("P").Append(s2).Append(":");
+                            for (int i = 0; i < Buttons; i++) nb.Append(mem.ReadVar(b2 + i) != 0 ? "1" : "0");
+                            nb.Append("  ");
+                        }
+                        Console.WriteLine(nb.ToString());
+                    }
                     lastTx = _txCount; lastRx = _rxCount;
                     statusNext = sw.ElapsedMilliseconds + 1000;
                 }
