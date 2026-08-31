@@ -31,6 +31,17 @@ namespace LvKSync
         /// <summary>他より何フレーム進んだら待つか。</summary>
         public int AheadLimit = 3;
 
+        // --- ずれ検知 ---
+        // キャラの状態が入っている範囲。ここをまとめた値を送って突き合わせる。
+        private const int CheckA = 10001, CheckACount = 799;    // V[10001..10799]
+        private const int CheckB = 22601, CheckBCount = 101;    // V[22601..22701]
+        /// <summary>何フレームごとに突き合わせるか。0 で無効。</summary>
+        public int CheckEvery = 30;
+        /// <summary>1ブロックあたりの変数の数。</summary>
+        private const int CheckBlock = 100;
+        private int[] _chkA, _chkB;
+        private uint[] _chkHashes;
+
         /// <summary>
         /// 進みすぎたときにゲームのプロセスを一瞬止めるか。
         /// 止めると確実に揃うが、ゲーム側の時間が乱れるので既定では使わない。
@@ -311,6 +322,38 @@ namespace LvKSync
             }
         }
 
+        /// <summary>キャラ状態をブロックごとにまとめる (FNV-1a)。</summary>
+        private bool StateHash(GameMemory mem)
+        {
+            if (!mem.ReadSpan(CheckA, CheckACount, _chkA)) return false;
+            if (!mem.ReadSpan(CheckB, CheckBCount, _chkB)) return false;
+            int b = HashBlocks(_chkA, 0);
+            HashBlocks(_chkB, b);
+            return true;
+        }
+
+        private int HashBlocks(int[] src, int outIndex)
+        {
+            unchecked
+            {
+                for (int off = 0; off < src.Length; off += CheckBlock)
+                {
+                    uint h = 2166136261;
+                    int end = Math.Min(off + CheckBlock, src.Length);
+                    for (int i = off; i < end; i++)
+                    {
+                        uint v = (uint)src[i];
+                        h = (h ^ (v & 0xFF)) * 16777619;
+                        h = (h ^ ((v >> 8) & 0xFF)) * 16777619;
+                        h = (h ^ ((v >> 16) & 0xFF)) * 16777619;
+                        h = (h ^ (v >> 24)) * 16777619;
+                    }
+                    _chkHashes[outIndex++] = h;
+                }
+            }
+            return outIndex;
+        }
+
         private static int Mod(int frame)
         {
             return ((frame % RingSize) + RingSize) % RingSize;
@@ -327,6 +370,15 @@ namespace LvKSync
             double nextDue = frameMs;
 
             int lastTick = -1;          // ゲームのフレームカウンタ V[654]
+            if (_chkA == null)
+            {
+                _chkA = new int[CheckACount];
+                _chkB = new int[CheckBCount];
+                int nb = (CheckACount + CheckBlock - 1) / CheckBlock
+                       + (CheckBCount + CheckBlock - 1) / CheckBlock;
+                _chkHashes = new uint[nb];
+            }
+            int checkNextTick = 0;
             int statNextTick = 0;
             long statStall = 0;
             var lastWritten = new ushort[Proto.MaxPlayers];
@@ -421,6 +473,21 @@ namespace LvKSync
                     }
                     haveWritten = true;
                     FrameLag = 0;
+
+                    // 一定フレームごとに、キャラ状態をまとめた値をサーバーへ送る。
+                    // 同じフレームの値が全員で一致していれば同期できている。
+                    // フレーム番号そのものを基準にする。こうしないと
+                    // クライアントごとに別のフレームを送ってしまい、比べられない。
+                    if (CheckEvery > 0 && tick % CheckEvery == 0 && tick != checkNextTick)
+                    {
+                        checkNextTick = tick;
+                        if (StateHash(mem))
+                        {
+                            var cp = Proto.Build(Proto.MsgCheck,
+                                Proto.CheckPayload(MySlot, tick, _chkHashes));
+                            try { lock (st) st.Write(cp, 0, cp.Length); } catch { }
+                        }
+                    }
 
                     // 進みすぎていたら、ゲームを一瞬止めて他を待つ。
                     // ここを止めないと、まだ届いていない入力のフレームに突っ込んでしまう。

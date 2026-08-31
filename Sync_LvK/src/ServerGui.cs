@@ -73,6 +73,18 @@ namespace LvKSync
 
         private readonly Stopwatch _clock = Stopwatch.StartNew();
 
+        // --- ずれ検知 ---
+        private const int CheckRing = 64;
+        private readonly int[] _chkFrame = new int[CheckRing];
+        private readonly uint[,][] _chkHash = new uint[CheckRing, Proto.MaxPlayers + 1][];
+        private readonly bool[,] _chkHave = new bool[CheckRing, Proto.MaxPlayers + 1];
+        private readonly object _chkGate = new object();
+
+        /// <summary>最後にずれを見つけたフレーム。0 ならまだ無事。</summary>
+        public int DesyncFrame;
+        public long DesyncCount;
+        public int CheckedFrames;
+
         public event Action<string> Log;
         public event Action RosterChanged;
 
@@ -263,6 +275,17 @@ namespace LvKSync
                     var pong = Proto.Build(Proto.MsgPong, payload);
                     try { lock (st) st.Write(pong, 0, pong.Length); } catch { break; }
                 }
+                else if (type == Proto.MsgCheck && payload.Length >= 6)
+                {
+                    int cf = BitConverter.ToInt32(payload, 1);
+                    int nb = payload[5];
+                    if (nb > 0 && payload.Length >= 6 + nb * 4)
+                    {
+                        var hs = new uint[nb];
+                        for (int k = 0; k < nb; k++) hs[k] = BitConverter.ToUInt32(payload, 6 + k * 4);
+                        CheckState(peer, cf, hs);
+                    }
+                }
                 else if (type == Proto.MsgBye) break;
             }
 
@@ -270,6 +293,49 @@ namespace LvKSync
             try { tcp.Close(); } catch { }
             Say(string.Format("[INFO] {0}P の {1} が退出しました", peer.Slot, peer.Name));
             BroadcastRoster();
+        }
+
+        /// <summary>
+        /// 同じフレームのチェックサムを突き合わせる。
+        /// 食い違ったら、そのフレームでゲームの中身が分かれたということ。
+        /// </summary>
+        private void CheckState(Peer peer, int frame, uint[] hashes)
+        {
+            if (frame <= 0) return;
+            int i = ((frame % CheckRing) + CheckRing) % CheckRing;
+            string bad = null;
+            lock (_chkGate)
+            {
+                if (_chkFrame[i] != frame)
+                {
+                    _chkFrame[i] = frame;
+                    for (int k = 0; k <= Proto.MaxPlayers; k++) _chkHave[i, k] = false;
+                }
+                _chkHash[i, peer.Slot] = hashes;
+                _chkHave[i, peer.Slot] = true;
+
+                for (int k = 1; k <= Proto.MaxPlayers; k++)
+                {
+                    if (k == peer.Slot || !_chkHave[i, k]) continue;
+                    var other = _chkHash[i, k];
+                    if (other == null || other.Length != hashes.Length) break;
+                    CheckedFrames++;
+                    for (int b = 0; b < hashes.Length; b++)
+                    {
+                        if (hashes[b] == other[b]) continue;
+                        // 何番目のかたまりが分かれたか = だいたいどの変数か
+                        int first = (b < 8) ? (10001 + b * 100) : (22601 + (b - 8) * 100);
+                        bad = string.Format(
+                            "[WARN] frame {0} で状態が分かれました  V[{1}..{2}] あたり  {3}P={4:X8} {5}P={6:X8}",
+                            frame, first, first + 99, peer.Slot, hashes[b], k, other[b]);
+                        DesyncFrame = frame;
+                        DesyncCount++;
+                        break;
+                    }
+                    break;
+                }
+            }
+            if (bad != null) Say(bad);
         }
 
         /// <summary>フレーム番号付きの入力をそのまま全員へ回す。</summary>
@@ -421,6 +487,7 @@ namespace LvKSync
         private readonly TextBox _logBox = new TextBox();
         private readonly Label _hint = new Label();
         private readonly ComboBox _level = new ComboBox();
+        private readonly Label _sync = new Label();
         private readonly Button _openLog = new Button();
         private readonly Label _logPath = new Label();
         private readonly WinTimer _timer = new WinTimer();
@@ -487,6 +554,10 @@ namespace LvKSync
             _btn.Text = "開始";
             _btn.Click += OnToggle;
             top.Controls.Add(_btn);
+            _sync.SetBounds(330, 73, 360, 20);
+            _sync.ForeColor = Color.FromArgb(20, 110, 60);
+            _sync.Text = "同期: まだ確認していません";
+            top.Controls.Add(_sync);
             _hint.SetBounds(10, 42, 670, 22);
             _hint.ForeColor = Color.FromArgb(70, 70, 70);
             _hint.Text = "参加者に伝えるアドレス: (開始すると表示されます)";
@@ -664,6 +735,21 @@ namespace LvKSync
                 }
             }
             _list.EndUpdate();
+
+            if (!_engine.Running) _sync.Text = "";
+            else if (_engine.DesyncFrame > 0)
+            {
+                _sync.ForeColor = Color.FromArgb(180, 40, 40);
+                _sync.Text = string.Format("同期: frame {0} でずれました ({1}回)",
+                    _engine.DesyncFrame, _engine.DesyncCount);
+            }
+            else if (_engine.CheckedFrames > 0)
+            {
+                _sync.ForeColor = Color.FromArgb(20, 110, 60);
+                _sync.Text = string.Format("同期: 一致 ({0}回 確認)", _engine.CheckedFrames);
+            }
+            else _sync.Text = "同期: まだ確認していません";
+
             LogStats(peers);
         }
 

@@ -131,6 +131,15 @@ namespace LvKSync
             return 0;
         }
 
+        /// <summary>続いた範囲の変数をまとめて読む。1個ずつ読むより桁違いに速い。</summary>
+        public bool ReadSpan(int firstIndex, int count, int[] dst)
+        {
+            var buf = new byte[count * 4];
+            if (!ReadRaw(VarBase + (long)firstIndex * 4, buf, buf.Length)) return false;
+            for (int i = 0; i < count; i++) dst[i] = BitConverter.ToInt32(buf, i * 4);
+            return true;
+        }
+
         public bool ReadRaw(long addr, byte[] buf, int size)
         {
             int got;
@@ -340,6 +349,7 @@ namespace LvKSync
         public const byte MsgPing = 7;     // C->S  [stamp 8]  往復時間の測定
         public const byte MsgPong = 8;     // S->C  [stamp 8]  そのまま返す
         public const byte MsgRoster = 9;   // S->C  誰が何Pに座っているか
+        public const byte MsgCheck = 10;   // C->S  [スロット 1][フレーム 4][チェックサム 4]
 
         public const int MaxNameBytes = 24;
 
@@ -388,6 +398,18 @@ namespace LvKSync
             p[0] = (byte)slot;
             Buffer.BlockCopy(BitConverter.GetBytes(frame), 0, p, 1, 4);
             Buffer.BlockCopy(BitConverter.GetBytes(mask), 0, p, 5, 2);
+            return p;
+        }
+
+        /// <summary>ずれ検知用。ブロックごとの値を並べる。どこから分かれたか分かる。</summary>
+        public static byte[] CheckPayload(int slot, int frame, uint[] hashes)
+        {
+            var p = new byte[6 + hashes.Length * 4];
+            p[0] = (byte)slot;
+            Buffer.BlockCopy(BitConverter.GetBytes(frame), 0, p, 1, 4);
+            p[5] = (byte)hashes.Length;
+            for (int i = 0; i < hashes.Length; i++)
+                Buffer.BlockCopy(BitConverter.GetBytes(hashes[i]), 0, p, 6 + i * 4, 4);
             return p;
         }
 
