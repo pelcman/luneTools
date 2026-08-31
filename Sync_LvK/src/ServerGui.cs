@@ -254,7 +254,11 @@ namespace LvKSync
                 if (type == Proto.MsgInput && payload.Length >= 7)
                 {
                     peer.PrevGameFrame = peer.GameFrame;
-                    peer.GameFrame = BitConverter.ToInt32(payload, 1);
+                    // 7バイト目から先があれば、それが送り主の実際のゲームフレーム。
+                    // 無ければ従来どおり宛先フレームで代用する。
+                    peer.GameFrame = (payload.Length >= 11)
+                        ? BitConverter.ToInt32(payload, 7)
+                        : BitConverter.ToInt32(payload, 1);
                     ushort nm = BitConverter.ToUInt16(payload, 5);
                     if (nm != peer.Mask)
                         Detail(string.Format("[INFO] {0}P {1} が {2} を操作しました  ({3})",
@@ -448,8 +452,17 @@ namespace LvKSync
                 }
                 if (minFrame == int.MaxValue) minFrame = 0;
 
+                // 一番進んでいる人。遅れている人はここに合わせて先まで送る。
+                int maxFrame = 0;
+                for (int i = 1; i <= Proto.MaxPlayers; i++)
+                {
+                    var q = peers[i];
+                    if (q == null || q.GameFrame <= 0) continue;
+                    if (q.GameFrame > maxFrame) maxFrame = q.GameFrame;
+                }
+
                 var pkt = Proto.Build(Proto.MsgFrame,
-                    Proto.FramePayloadWithBase(_frame, masks, connected, minFrame));
+                    Proto.FramePayloadWithBase(_frame, masks, connected, minFrame, maxFrame));
 
                 // 予定時刻からどれだけ遅れて配信したか
                 double late = now - (next - interval);

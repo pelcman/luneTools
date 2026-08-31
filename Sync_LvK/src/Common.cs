@@ -423,6 +423,19 @@ namespace LvKSync
             return true;
         }
 
+        /// <summary>
+        /// 入力。宛先フレームのほかに、送り主の実際のゲームフレームも載せる。
+        /// 宛先だけを見ると「先まで送るほど進んでいる」と誤解してしまう。
+        /// </summary>
+        public static byte[] InputPayloadWithTick(int slot, int frame, ushort mask, int tick)
+        {
+            var head = InputPayload(slot, frame, mask);
+            var p = new byte[head.Length + 4];
+            Buffer.BlockCopy(head, 0, p, 0, head.Length);
+            Buffer.BlockCopy(BitConverter.GetBytes(tick), 0, p, head.Length, 4);
+            return p;
+        }
+
         public static byte[] InputPayload(int slot, int frame, ushort mask)
         {
             var p = new byte[7];
@@ -540,12 +553,14 @@ namespace LvKSync
         /// 配信フレーム。末尾に「ゲームフレーム0 に対応するサーバーフレーム」を付ける。
         /// 古い形 (13バイト) も読めるように、後ろに足すだけにしてある。
         /// </summary>
-        public static byte[] FramePayloadWithBase(int frame, ushort[] masks, byte connected, int matchBase)
+        public static byte[] FramePayloadWithBase(int frame, ushort[] masks, byte connected,
+            int minFrame, int maxFrame)
         {
             var head = FramePayload(frame, masks, connected);
-            var p = new byte[head.Length + 4];
+            var p = new byte[head.Length + 8];
             Buffer.BlockCopy(head, 0, p, 0, head.Length);
-            Buffer.BlockCopy(BitConverter.GetBytes(matchBase), 0, p, head.Length, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(minFrame), 0, p, head.Length, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(maxFrame), 0, p, head.Length + 4, 4);
             return p;
         }
 

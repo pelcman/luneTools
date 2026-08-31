@@ -31,6 +31,9 @@ namespace LvKSync
         /// <summary>他より何フレーム進んだら待つか。</summary>
         public int AheadLimit = 3;
 
+        /// <summary>送り先の先読み量の上限。これ以上は伸ばさない。</summary>
+        private const int MaxSendDelay = 30;
+
         /// <summary>
         /// 何フレーム先ぶんを前もって書いておくか。
         /// ゲームはフレームの頭で入力を読むので、tick が変わってから書くと
@@ -95,6 +98,8 @@ namespace LvKSync
         public volatile int AppliedFrame;      // いまゲームに書いているフレーム
         private volatile int _matchBase = int.MinValue;   // 未使用 (旧方式の名残)
         private volatile int _minGameFrame;                // 全員のうち一番遅れているフレーム
+        private volatile int _maxGameFrame;                // 全員のうち一番進んでいるフレーム
+        private volatile int _sendDelay;                   // 実際に使っている送り先の先読み量
         public volatile int AheadBy;                       // 自分が何フレーム進んでいるか
         public long WaitCount;                             // 進みすぎて待った回数
         public long MissedTicks;                           // 見逃したゲームフレーム数
@@ -135,6 +140,7 @@ namespace LvKSync
             MySlot = 0; RttMs = -1; TxCount = 0; RxCount = 0; VarBase = 0; Pid = 0;
             _serverFrame = -1; AppliedFrame = 0; FrameLag = 0; InMatch = false; StallCount = 0;
             _matchBase = int.MinValue; _gameFrame = 0;
+            _minGameFrame = 0; _maxGameFrame = 0; _sendDelay = 0;
             for (int i = 0; i < RingSize; i++)
             {
                 _ring[i] = new ushort[Proto.MaxPlayers];
@@ -333,6 +339,8 @@ namespace LvKSync
                     // 末尾に「全員のうち一番遅れているフレーム」が付いている
                     if (p.Length >= 4 + Proto.MaxPlayers * 2 + 1 + 4)
                         _minGameFrame = BitConverter.ToInt32(p, 4 + Proto.MaxPlayers * 2 + 1);
+                    if (p.Length >= 4 + Proto.MaxPlayers * 2 + 1 + 8)
+                        _maxGameFrame = BitConverter.ToInt32(p, 4 + Proto.MaxPlayers * 2 + 5);
                 }
                 else if (type == Proto.MsgInput && p.Length >= 7)
                 {
@@ -538,8 +546,20 @@ namespace LvKSync
                     for (int i = 0; i < Buttons; i++)
                         if (Util.KeyDown(Keys[i])) mask |= (ushort)(1 << i);
                     LocalMask = mask;
+
+                    // 自分が遅れているぶんだけ、先のフレーム宛に送る。
+                    // そうしないと、先行している相手が自分の入力を待てずに取りこぼす。
+                    // 送り先は増やす方向にしか変えない。減らすと同じフレームへ
+                    // 二重に書いてしまい、どちらが残るかが受け手ごとに変わる。
+                    int lag = _maxGameFrame - tick;
+                    if (lag < 0) lag = 0;
+                    int want = DelayFrames + lag + 2;
+                    if (want > MaxSendDelay) want = MaxSendDelay;     // 暴走よけ
+                    if (want > _sendDelay) _sendDelay = want;
+                    if (_sendDelay < DelayFrames) _sendDelay = DelayFrames;
+
                     var pkt = Proto.Build(Proto.MsgInput,
-                        Proto.InputPayload(MySlot, tick + DelayFrames, mask));
+                        Proto.InputPayloadWithTick(MySlot, tick + _sendDelay, mask, tick));
                     try { lock (st) st.Write(pkt, 0, pkt.Length); TxCount++; }
                     catch { Say("サーバーとの接続が切れました。"); break; }
 
@@ -597,8 +617,8 @@ namespace LvKSync
                     if (tick >= statNextTick)
                     {
                         if (statNextTick > 0)
-                            Say(string.Format("[INFO] frame={0}  入力待ち {1}  見逃し {2}  進み {3}",
-                                tick, StallCount - statStall, MissedTicks, AheadBy));
+                            Say(string.Format("[INFO] frame={0}  入力待ち {1}  見逃し {2}  進み {3}  先読み {4}",
+                                tick, StallCount - statStall, MissedTicks, AheadBy, _sendDelay));
                         statStall = StallCount;
                         statNextTick = tick + 60;
                     }
