@@ -77,6 +77,8 @@ namespace LvKSync
         private const int CheckRing = 64;
         private readonly int[] _chkFrame = new int[CheckRing];
         private readonly uint[,][] _chkHash = new uint[CheckRing, Proto.MaxPlayers + 1][];
+        private readonly int[,][] _chkFirst = new int[CheckRing, Proto.MaxPlayers + 1][];
+        private readonly int[,][] _chkCount = new int[CheckRing, Proto.MaxPlayers + 1][];
         private readonly bool[,] _chkHave = new bool[CheckRing, Proto.MaxPlayers + 1];
         private readonly object _chkGate = new object();
 
@@ -279,11 +281,19 @@ namespace LvKSync
                 {
                     int cf = BitConverter.ToInt32(payload, 1);
                     int nb = payload[5];
-                    if (nb > 0 && payload.Length >= 6 + nb * 4)
+                    if (nb > 0 && payload.Length >= 6 + nb * 10)
                     {
+                        var fs = new int[nb];
+                        var cs = new int[nb];
                         var hs = new uint[nb];
-                        for (int k = 0; k < nb; k++) hs[k] = BitConverter.ToUInt32(payload, 6 + k * 4);
-                        CheckState(peer, cf, hs);
+                        for (int k = 0; k < nb; k++)
+                        {
+                            int bo = 6 + k * 10;
+                            fs[k] = BitConverter.ToInt32(payload, bo);
+                            cs[k] = BitConverter.ToUInt16(payload, bo + 4);
+                            hs[k] = BitConverter.ToUInt32(payload, bo + 6);
+                        }
+                        CheckState(peer, cf, fs, cs, hs);
                     }
                 }
                 else if (type == Proto.MsgBye) break;
@@ -299,7 +309,7 @@ namespace LvKSync
         /// 同じフレームのチェックサムを突き合わせる。
         /// 食い違ったら、そのフレームでゲームの中身が分かれたということ。
         /// </summary>
-        private void CheckState(Peer peer, int frame, uint[] hashes)
+        private void CheckState(Peer peer, int frame, int[] firsts, int[] counts, uint[] hashes)
         {
             if (frame <= 0) return;
             int i = ((frame % CheckRing) + CheckRing) % CheckRing;
@@ -312,6 +322,8 @@ namespace LvKSync
                     for (int k = 0; k <= Proto.MaxPlayers; k++) _chkHave[i, k] = false;
                 }
                 _chkHash[i, peer.Slot] = hashes;
+                _chkFirst[i, peer.Slot] = firsts;
+                _chkCount[i, peer.Slot] = counts;
                 _chkHave[i, peer.Slot] = true;
 
                 for (int k = 1; k <= Proto.MaxPlayers; k++)
@@ -323,11 +335,11 @@ namespace LvKSync
                     for (int b = 0; b < hashes.Length; b++)
                     {
                         if (hashes[b] == other[b]) continue;
-                        // 何番目のかたまりが分かれたか = だいたいどの変数か
-                        int first = (b < 8) ? (10001 + b * 100) : (22601 + (b - 8) * 100);
+                        int first = firsts[b];
+                        int last = first + counts[b] - 1;
                         bad = string.Format(
-                            "[WARN] frame {0} で状態が分かれました  V[{1}..{2}] あたり  {3}P={4:X8} {5}P={6:X8}",
-                            frame, first, first + 99, peer.Slot, hashes[b], k, other[b]);
+                            "[WARN] frame {0} で状態が分かれました  V[{1}..{2}]  {3}P={4:X8} {5}P={6:X8}",
+                            frame, first, last, peer.Slot, hashes[b], k, other[b]);
                         DesyncFrame = frame;
                         DesyncCount++;
                         break;

@@ -158,6 +158,15 @@ namespace LvKPatch
         /// <summary>プレイヤーNのパッド拡張コード。821-826 / 827-832 / 833-838 / 839-844。</summary>
         private const int SrcFirst = 821;
 
+        /// <summary>試合のフレームカウンタ。</summary>
+        private const int TickVar = 654;
+
+        /// <summary>この数フレームのあいだ入力を無効にする。</summary>
+        public const int StartGuardFrames = 3;
+
+        /// <summary>ゼロが並んでいる場所 (netbase からの位置)。同期ツールが0で埋める。</summary>
+        public const int ZeroBlockOffset = 30;
+
         /// <summary>
         /// 「3014 を6回続けて V[321..326] へ読み込む」群を形で探す。
         /// オフセット決め打ちにしないので、作者がイベントを足しても見つかる。
@@ -230,18 +239,52 @@ namespace LvKPatch
             return 0;
         }
 
-        /// <summary>群ひとつを 3013 のコピー1個 + 詰め物で置き換える。長さは変えない。</summary>
+        /// <summary>
+        /// 群ひとつを置き換える。長さは変えない。
+        ///   ネットワーク入力をコピー → 試合の頭の数フレームならゼロで上書き
+        /// </summary>
         public static byte[] MakeReplacement(Group g, int netbase)
         {
             int src = netbase + (g.Player - 1) * Buttons;
-            var cmd = Lcf.BuildCmd(3013, g.Indent, null,
+            int zero = netbase + ZeroBlockOffset;
+
+            var ms = new MemoryStream();
+            // ネットワークから届いた入力を入れる
+            var c1 = Lcf.BuildCmd(3013, g.Indent, null,
                 new int[] { 0, 0, src, Buttons, DestFirst });
-            if (cmd.Length > g.Size)
-                throw new InvalidOperationException("置き換えが領域に入りません");
-            var pad = Lcf.Filler(g.Size - cmd.Length, g.Indent);
+            ms.Write(c1, 0, c1.Length);
+
+            // 試合が始まった直後の数フレームだけ入力を無効にする。
+            // 開始ボタンの押しっぱなしが1フレーム目に残ると、インスタンスごとに
+            // 拾うか拾わないかが変わってしまうため。
+            //
+            // V[654] は試合外では 0 なので、上限だけで見るとキャラ選択でも
+            // 入力が消えてしまう。1 以上 かつ 数フレーム以下、の入れ子にする。
+            //   12010 [型=変数, 変数, 相手=定数, 値, 比較, else無し]
+            //   比較 0:= 1:以上 2:以下 3:超 4:未満 5:≠
+            var c2 = Lcf.BuildCmd(12010, g.Indent, null,
+                new int[] { 1, TickVar, 0, 1, 1, 0 });
+            ms.Write(c2, 0, c2.Length);
+            var c3 = Lcf.BuildCmd(12010, g.Indent + 1, null,
+                new int[] { 1, TickVar, 0, StartGuardFrames, 2, 0 });
+            ms.Write(c3, 0, c3.Length);
+            var c4 = Lcf.BuildCmd(3013, g.Indent + 2, null,
+                new int[] { 0, 0, zero, Buttons, DestFirst });
+            ms.Write(c4, 0, c4.Length);
+            var c5 = Lcf.BuildCmd(22011, g.Indent + 1, null, new int[0]);
+            ms.Write(c5, 0, c5.Length);
+            var c6 = Lcf.BuildCmd(22011, g.Indent, null, new int[0]);
+            ms.Write(c6, 0, c6.Length);
+
+            var body = ms.ToArray();
+            if (body.Length > g.Size)
+                throw new InvalidOperationException(
+                    string.Format("置き換えが {0} バイトで、領域 {1} バイトに入りません",
+                        body.Length, g.Size));
+            var pad = Lcf.Filler(g.Size - body.Length, g.Indent);
             var blob = new byte[g.Size];
-            Buffer.BlockCopy(cmd, 0, blob, 0, cmd.Length);
-            Buffer.BlockCopy(pad, 0, blob, cmd.Length, pad.Length);
+            Buffer.BlockCopy(body, 0, blob, 0, body.Length);
+            Buffer.BlockCopy(pad, 0, blob, body.Length, pad.Length);
             return blob;
         }
 
@@ -519,8 +562,8 @@ namespace LvKPatch
                     Buffer.BlockCopy(blob, 0, buf, g.Offset, blob.Length);
                     Patcher.Verify(buf, g);
                     int src = netbase + (g.Player - 1) * 6;
-                    Say(string.Format("  0x{0:X6}  {1}P  ←  V[{2}..{3}] を V[321..326] へコピー",
-                        g.Offset, g.Player, src, src + 5));
+                    Say(string.Format("  0x{0:X6}  {1}P  ←  V[{2}..{3}] を V[321..326] へ (最初の{4}フレームは無効)",
+                        g.Offset, g.Player, src, src + 5, Patcher.StartGuardFrames));
                     applied++;
                 }
             }

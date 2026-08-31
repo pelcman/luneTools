@@ -86,11 +86,17 @@ namespace LvKSync
             return BitConverter.ToInt32(_s4, 0);
         }
 
+        private readonly byte[] _w4 = new byte[4];
+
         public void WriteVar(int index, int value)
         {
+            // 毎フレーム何十回も呼ぶので、そのつど配列を作らない
+            _w4[0] = (byte)value;
+            _w4[1] = (byte)(value >> 8);
+            _w4[2] = (byte)(value >> 16);
+            _w4[3] = (byte)(value >> 24);
             int wrote;
-            Native.WriteProcessMemory(_h, (IntPtr)(VarBase + (long)index * 4),
-                BitConverter.GetBytes(value), 4, out wrote);
+            Native.WriteProcessMemory(_h, (IntPtr)(VarBase + (long)index * 4), _w4, 4, out wrote);
         }
 
         public void ReadVars(int[] idx, int[] dst)
@@ -117,15 +123,30 @@ namespace LvKSync
             return true;
         }
 
+        private string _modName;
+        private long _modBase;
+        private int _modSize;
+
+        /// <summary>
+        /// モジュールの位置。起動中は変わらないので一度だけ調べて覚えておく。
+        /// Process.Modules の列挙は重く、毎フレーム呼ぶとゲームのフレームを見逃す。
+        /// </summary>
         public long ModuleBase(string name, out int size)
         {
+            if (_modBase != 0 && _modName == name) { size = _modSize; return _modBase; }
             size = 0;
             try
             {
                 var p = Process.GetProcessById(Pid);
                 foreach (ProcessModule m in p.Modules)
                     if (m.ModuleName.Equals(name, StringComparison.OrdinalIgnoreCase))
-                    { size = m.ModuleMemorySize; return (long)m.BaseAddress; }
+                    {
+                        size = m.ModuleMemorySize;
+                        _modName = name;
+                        _modBase = (long)m.BaseAddress;
+                        _modSize = size;
+                        return _modBase;
+                    }
             }
             catch { }
             return 0;
@@ -146,11 +167,21 @@ namespace LvKSync
             return Native.ReadProcessMemory(_h, (IntPtr)addr, buf, size, out got) && got == size;
         }
 
+        private Process _proc;
+
+        /// <summary>
+        /// ゲームがまだ動いているか。
+        /// Process を毎回取り直すと非常に重いので、一度掴んだら使い回す。
+        /// </summary>
         public bool Alive
         {
             get
             {
-                try { var p = Process.GetProcessById(Pid); return !p.HasExited; }
+                try
+                {
+                    if (_proc == null) _proc = Process.GetProcessById(Pid);
+                    return !_proc.HasExited;
+                }
                 catch { return false; }
             }
         }
@@ -401,15 +432,24 @@ namespace LvKSync
             return p;
         }
 
-        /// <summary>ずれ検知用。ブロックごとの値を並べる。どこから分かれたか分かる。</summary>
-        public static byte[] CheckPayload(int slot, int frame, uint[] hashes)
+        /// <summary>
+        /// ずれ検知用。ブロックごとに「先頭の変数番号」と「まとめた値」を並べる。
+        /// 番号を一緒に送るので、範囲を変えてもサーバー側を直さなくてよい。
+        /// </summary>
+        public static byte[] CheckPayload(int slot, int frame, int[] firsts, int[] counts, uint[] hashes)
         {
-            var p = new byte[6 + hashes.Length * 4];
+            int n = hashes.Length;
+            var p = new byte[6 + n * 10];
             p[0] = (byte)slot;
             Buffer.BlockCopy(BitConverter.GetBytes(frame), 0, p, 1, 4);
-            p[5] = (byte)hashes.Length;
-            for (int i = 0; i < hashes.Length; i++)
-                Buffer.BlockCopy(BitConverter.GetBytes(hashes[i]), 0, p, 6 + i * 4, 4);
+            p[5] = (byte)n;
+            for (int i = 0; i < n; i++)
+            {
+                int b = 6 + i * 10;
+                Buffer.BlockCopy(BitConverter.GetBytes(firsts[i]), 0, p, b, 4);
+                Buffer.BlockCopy(BitConverter.GetBytes((ushort)counts[i]), 0, p, b + 4, 2);
+                Buffer.BlockCopy(BitConverter.GetBytes(hashes[i]), 0, p, b + 6, 4);
+            }
             return p;
         }
 

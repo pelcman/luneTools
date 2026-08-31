@@ -31,15 +31,30 @@ namespace LvKSync
         /// <summary>他より何フレーム進んだら待つか。</summary>
         public int AheadLimit = 3;
 
+        /// <summary>
+        /// 何フレーム先ぶんを前もって書いておくか。
+        /// ゲームはフレームの頭で入力を読むので、tick が変わってから書くと
+        /// 読み終えた後になることがある。先に置いておけば競争にならない。
+        /// </summary>
+        public int WriteAhead = 1;
+
         // --- ずれ検知 ---
-        // キャラの状態が入っている範囲。ここをまとめた値を送って突き合わせる。
-        private const int CheckA = 10001, CheckACount = 799;    // V[10001..10799]
-        private const int CheckB = 22601, CheckBCount = 101;    // V[22601..22701]
+        // 見る範囲。入力まわりの低い番号も含めて、非決定性がどこから入るかを見る。
+        private static readonly int[][] CheckRanges =
+        {
+            // 4窓デモで実測した「同期しないと壊れる」範囲。
+            // 低い番号のテンポラリや、プレイヤー間で使い回す入力領域は入れない。
+            new[] { 10001, 85 }, new[] { 10101, 38 }, new[] { 10173, 154 },
+            new[] { 10340, 11 }, new[] { 10373, 87 }, new[] { 10492, 13 },
+            new[] { 10523, 27 }, new[] { 10570, 90 }, new[] { 10680, 24 },
+            new[] { 10770, 30 }, new[] { 22601, 64 }, new[] { 22690, 12 },
+        };
         /// <summary>何フレームごとに突き合わせるか。0 で無効。</summary>
         public int CheckEvery = 30;
         /// <summary>1ブロックあたりの変数の数。</summary>
         private const int CheckBlock = 100;
-        private int[] _chkA, _chkB;
+        private int[][] _chkBuf;
+        private int[] _chkFirsts, _chkCounts;
         private uint[] _chkHashes;
 
         /// <summary>
@@ -54,6 +69,9 @@ namespace LvKSync
         [DllImport("ntdll.dll")] private static extern int NtResumeProcess(IntPtr h);
         [DllImport("kernel32.dll")] private static extern IntPtr OpenProcess(int a, bool b, int pid);
         [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr h);
+        // 既定では Sleep(1) が約15ms眠ってしまい、ゲームのフレームを見逃す
+        [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
+        [DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint ms);
         private IntPtr _susp = IntPtr.Zero;
 
         // --- 設定 ---
@@ -79,6 +97,8 @@ namespace LvKSync
         private volatile int _minGameFrame;                // 全員のうち一番遅れているフレーム
         public volatile int AheadBy;                       // 自分が何フレーム進んでいるか
         public long WaitCount;                             // 進みすぎて待った回数
+        public long MissedTicks;                           // 見逃したゲームフレーム数
+        private volatile int _checkWanted;                 // 突き合わせたいフレーム
         private volatile int _gameFrame;       // サーバーへ知らせる自分のゲームframe
         public volatile int FrameLag;          // サーバーより何フレーム後ろか
         public volatile bool InMatch;
@@ -124,6 +144,8 @@ namespace LvKSync
             Roster = new string[Proto.MaxPlayers + 1];
             RemoteMasks = new ushort[Proto.MaxPlayers];
             _worker = new Thread(Work) { IsBackground = true };
+            // ゲームのフレームを1つでも見逃すと同期が崩れるので、優先して回す
+            try { _worker.Priority = ThreadPriority.Highest; } catch { }
             _worker.Start();
         }
 
@@ -144,7 +166,9 @@ namespace LvKSync
             var mem = _mem;
             if (mem == null || VarBase == 0) return null;
             var v = new int[Proto.MaxPlayers * Buttons];
-            try { for (int i = 0; i < v.Length; i++) v[i] = mem.ReadVar(NetBase + i); }
+            // ReadVar は入力スレッドと同じバッファを使うので、ここでは使わない。
+            // 同時に呼ぶと読み取りが混ざる。
+            try { if (!mem.ReadSpan(NetBase, v.Length, v)) return null; }
             catch { return null; }
             return v;
         }
@@ -160,6 +184,7 @@ namespace LvKSync
 
         private void Work()
         {
+            try { timeBeginPeriod(1); } catch { }
             try { WorkCore(); }
             catch (Exception ex) { Say("エラー: " + ex.Message); }
             finally
@@ -168,6 +193,7 @@ namespace LvKSync
                 Phase = "停止中";
                 try { if (_tcp != null) _tcp.Close(); } catch { }
                 _tcp = null; _st = null;
+                try { timeEndPeriod(1); } catch { }
                 if (_susp != IntPtr.Zero)
                 {
                     try { NtResumeProcess(_susp); } catch { }
@@ -220,6 +246,9 @@ namespace LvKSync
             if (_stop) return;
             _mem.VarBase = vb;
             VarBase = vb;
+            // パッチが「試合の頭で入力を無効にする」ために読むゼロの並び。
+            // ここが 0 でないと最初の数フレームに変な入力が入る。
+            for (int z = 0; z < Buttons; z++) _mem.WriteVar(NetBase + 30 + z, 0);
             Say(string.Format("ゲームのデータを見つけました  0x{0:X}  ({1})", vb, method));
 
             // --- 接続 ---
@@ -252,9 +281,36 @@ namespace LvKSync
             Bump();
 
             new Thread(ReceiveLoop) { IsBackground = true }.Start();
+            new Thread(CheckLoop) { IsBackground = true }.Start();
             new Thread(PingLoop) { IsBackground = true }.Start();
 
             MainLoop(needIndex);
+        }
+
+        /// <summary>
+        /// 突き合わせ用の値を計算して送る。
+        /// 入力を扱うループを遅らせないよう、別スレッドでゆっくり回す。
+        /// </summary>
+        private void CheckLoop()
+        {
+            var st = _st;
+            int done = 0;
+            while (!_stop)
+            {
+                int want = _checkWanted;
+                if (want == done || want <= 0) { Thread.Sleep(2); continue; }
+                done = want;
+                var mem = _mem;
+                if (mem == null) { Thread.Sleep(5); continue; }
+                try
+                {
+                    if (!StateHash(mem, want)) continue;
+                    var cp = Proto.Build(Proto.MsgCheck,
+                        Proto.CheckPayload(MySlot, want, _chkFirsts, _chkCounts, _chkHashes));
+                    lock (st) st.Write(cp, 0, cp.Length);
+                }
+                catch { }
+            }
         }
 
         private void ReceiveLoop()
@@ -322,17 +378,45 @@ namespace LvKSync
             }
         }
 
-        /// <summary>キャラ状態をブロックごとにまとめる (FNV-1a)。</summary>
-        private bool StateHash(GameMemory mem)
+        private void EnsureCheckBuffers()
         {
-            if (!mem.ReadSpan(CheckA, CheckACount, _chkA)) return false;
-            if (!mem.ReadSpan(CheckB, CheckBCount, _chkB)) return false;
-            int b = HashBlocks(_chkA, 0);
-            HashBlocks(_chkB, b);
-            return true;
+            if (_chkBuf != null) return;
+            _chkBuf = new int[CheckRanges.Length][];
+            int nb = 0;
+            for (int r = 0; r < CheckRanges.Length; r++)
+            {
+                _chkBuf[r] = new int[CheckRanges[r][1]];
+                nb += (CheckRanges[r][1] + CheckBlock - 1) / CheckBlock;
+            }
+            _chkHashes = new uint[nb];
+            _chkFirsts = new int[nb];
+            _chkCounts = new int[nb];
         }
 
-        private int HashBlocks(int[] src, int outIndex)
+        /// <summary>見る範囲をブロックごとにまとめる (FNV-1a)。</summary>
+        private readonly int[] _tick1 = new int[1];
+
+        /// <summary>
+        /// 見る範囲をブロックごとにまとめる。
+        /// 読んでいる途中でゲームが次のフレームへ進むと、前半と後半で
+        /// 別のフレームの値が混ざる。そうなった回は捨てる (false を返す)。
+        /// </summary>
+        private bool StateHash(GameMemory mem, int wantTick)
+        {
+            if (!mem.ReadSpan(VarBaseFinder.TickVar, 1, _tick1)) return false;
+            if (_tick1[0] != wantTick) return false;
+            int b = 0;
+            for (int r = 0; r < CheckRanges.Length; r++)
+            {
+                int first = CheckRanges[r][0], count = CheckRanges[r][1];
+                if (!mem.ReadSpan(first, count, _chkBuf[r])) return false;
+                b = HashBlocks(_chkBuf[r], first, b);
+            }
+            if (!mem.ReadSpan(VarBaseFinder.TickVar, 1, _tick1)) return false;
+            return _tick1[0] == wantTick;
+        }
+
+        private int HashBlocks(int[] src, int firstVar, int outIndex)
         {
             unchecked
             {
@@ -348,7 +432,10 @@ namespace LvKSync
                         h = (h ^ ((v >> 16) & 0xFF)) * 16777619;
                         h = (h ^ (v >> 24)) * 16777619;
                     }
-                    _chkHashes[outIndex++] = h;
+                    _chkFirsts[outIndex] = firstVar + off;
+                    _chkCounts[outIndex] = end - off;
+                    _chkHashes[outIndex] = h;
+                    outIndex++;
                 }
             }
             return outIndex;
@@ -364,20 +451,14 @@ namespace LvKSync
             var st = _st;
             var mem = _mem;
             int refreshCounter = 0;
+            int aliveCounter = 0;
             long localFrame = 0;
             var pacer = Stopwatch.StartNew();
             double frameMs = 1000.0 / 60.0;
             double nextDue = frameMs;
 
             int lastTick = -1;          // ゲームのフレームカウンタ V[654]
-            if (_chkA == null)
-            {
-                _chkA = new int[CheckACount];
-                _chkB = new int[CheckBCount];
-                int nb = (CheckACount + CheckBlock - 1) / CheckBlock
-                       + (CheckBCount + CheckBlock - 1) / CheckBlock;
-                _chkHashes = new uint[nb];
-            }
+            EnsureCheckBuffers();
             int checkNextTick = 0;
             int statNextTick = 0;
             long statStall = 0;
@@ -386,11 +467,16 @@ namespace LvKSync
 
             while (!_stop)
             {
-                if (!mem.Alive) { Say("ゲームが終了しました。"); break; }
+                // 生存確認も毎回やると重い。たまにでよい。
+                if (++aliveCounter >= 500)
+                {
+                    aliveCounter = 0;
+                    if (!mem.Alive) { Say("ゲームが終了しました。"); break; }
+                }
 
                 // 対戦の開始・終了で変数配列は作り直される。追従する。
                 // 遅れると古い配列を読んでしまうので、こまめに見る。
-                if (++refreshCounter >= 20)
+                if (++refreshCounter >= 300)
                 {
                     refreshCounter = 0;
                     if (VarBaseFinder.Refresh(mem, trackIndex))
@@ -405,7 +491,7 @@ namespace LvKSync
                 // 試合中は V[654] が毎フレーム進む。これを合図にして、
                 // サーバーのフレーム番号で並べた入力を 1フレームぶんずつ消費する。
                 // こうすると「押している長さ」がどのインスタンスでも同じ数のフレームになる。
-                if (_serverFrame < 0) { Thread.Sleep(0); continue; }
+                if (_serverFrame < 0) { Thread.Sleep(1); continue; }
 
                 int tick = mem.ReadVar(VarBaseFinder.TickVar);
 
@@ -431,7 +517,8 @@ namespace LvKSync
                     // --- 試合中 ---
                     // ゲームが1フレーム進むごとに、自分の入力を DelayFrames 先のフレーム宛に送り、
                     // このフレーム宛に届いている入力を当てる。実時間は一切使わないのでずれない。
-                    if (tick == lastTick) { Thread.Sleep(0); continue; }
+                    // フレームの変わり目を逃さないよう、譲らずに短く回して待つ
+                    if (tick == lastTick) { Thread.SpinWait(60); continue; }
 
                     if (!InMatch || lastTick < 0 || tick < lastTick)
                     {
@@ -443,6 +530,7 @@ namespace LvKSync
                         Say(string.Format("[INFO] 試合の同期を開始しました  ゲームframe={0}  遅延={1}",
                             tick, DelayFrames));
                     }
+                    if (lastTick > 0 && tick > lastTick + 1) MissedTicks += tick - lastTick - 1;
                     lastTick = tick;
                     AppliedFrame = tick;
 
@@ -455,13 +543,15 @@ namespace LvKSync
                     try { lock (st) st.Write(pkt, 0, pkt.Length); TxCount++; }
                     catch { Say("サーバーとの接続が切れました。"); break; }
 
-                    int mi = Mod(tick);
+                    // いま見えているフレームの「次」のぶんを置いておく
+                    int target = tick + WriteAhead;
+                    int mi = Mod(target);
                     var stampRow = _ringFrame[mi];
                     var maskRow = _ring[mi];
                     for (int s = 1; s <= Proto.MaxPlayers; s++)
                     {
                         if (s == MySlot && !ApplyOwn) continue;
-                        bool have = (stampRow[s - 1] == tick);
+                        bool have = (stampRow[s - 1] == target);
                         if (!have) StallCount++;
                         // 届いていないフレームは直前の入力を保つ
                         ushort mk = have ? maskRow[s - 1] : lastWritten[s - 1];
@@ -474,19 +564,12 @@ namespace LvKSync
                     haveWritten = true;
                     FrameLag = 0;
 
-                    // 一定フレームごとに、キャラ状態をまとめた値をサーバーへ送る。
-                    // 同じフレームの値が全員で一致していれば同期できている。
-                    // フレーム番号そのものを基準にする。こうしないと
-                    // クライアントごとに別のフレームを送ってしまい、比べられない。
+                    // 突き合わせは 600 変数ほど読むので重い。ここでやると
+                    // ゲームのフレームを見逃すため、番号を渡すだけにして別スレッドに任せる。
                     if (CheckEvery > 0 && tick % CheckEvery == 0 && tick != checkNextTick)
                     {
                         checkNextTick = tick;
-                        if (StateHash(mem))
-                        {
-                            var cp = Proto.Build(Proto.MsgCheck,
-                                Proto.CheckPayload(MySlot, tick, _chkHashes));
-                            try { lock (st) st.Write(cp, 0, cp.Length); } catch { }
-                        }
+                        _checkWanted = tick;
                     }
 
                     // 進みすぎていたら、ゲームを一瞬止めて他を待つ。
@@ -514,8 +597,8 @@ namespace LvKSync
                     if (tick >= statNextTick)
                     {
                         if (statNextTick > 0)
-                            Say(string.Format("[INFO] frame={0}  取りこぼし {1}  進み {2}  待ち {3}",
-                                tick, StallCount - statStall, AheadBy, WaitCount));
+                            Say(string.Format("[INFO] frame={0}  入力待ち {1}  見逃し {2}  進み {3}",
+                                tick, StallCount - statStall, MissedTicks, AheadBy));
                         statStall = StallCount;
                         statNextTick = tick + 60;
                     }
