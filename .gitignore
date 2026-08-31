@@ -8,6 +8,10 @@ SyncLvK.ini
 *.user
 obj/
 
+# 本体
+LvK/
+LvK2/
+
 # キャプチャやログ
 *.log
 *.bin

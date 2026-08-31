@@ -1,12 +1,53 @@
 @echo off
 chcp 932 >nul
-title LvKSync Client - P3
+title LvKSync クライアント - 3P
+set PORT=47801
+
+cls
+echo ==========================================================
+echo   LvKSync クライアント   あなたは 3P です
+echo ==========================================================
 echo.
-echo  プレイヤー3 のクライアントです。
-echo  ローカル入力の割り当て: A S D F + G H
+echo   あなたの操作キー :  A S D F  と  G H
 echo.
-set /p HOST=サーバーのIP (未入力なら 127.0.0.1): 
+echo ----------------------------------------------------------
+echo   準備できていますか
+echo ----------------------------------------------------------
+echo.
+echo    1. ゲーム ^(RPG_RT.exe^) を起動する
+echo    2. 対戦画面まで進める     ^<^<^< ここ大事
+echo.
+echo       キャラクター選択の画面ではまだダメです。
+echo       実際にキャラが並んで戦える画面まで進めてください。
+echo.
+
+rem --- ゲームが起動しているか確認 ---
+set GAMEFOUND=
+for /f "tokens=1" %%A in ('tasklist /FI "IMAGENAME eq RPG_RT.exe" /NH 2^>nul') do (
+  if /I "%%A"=="RPG_RT.exe" set GAMEFOUND=1
+)
+if not defined GAMEFOUND (
+  echo   [!!] ゲームがまだ起動していません。
+  echo.
+  echo        先にゲームを起動してから、もう一度このファイルを
+  echo        実行してください。
+  echo.
+  pause
+  exit /b
+) else (
+  echo   [OK] ゲームの起動を確認しました
+)
+echo.
+echo ----------------------------------------------------------
+echo.
+set /p HOST=サーバーのIPを入力して Enter ^(自分のPCなら空Enter^): 
 if "%HOST%"=="" set HOST=127.0.0.1
 echo.
-"%~dp0bin\LvKSyncClient.exe" --host %HOST% --slot 3 --index 2 --local-keys S,F,D,A,G,H
+echo   %HOST%:%PORT% に接続します...
+echo.
+
+"%~dp0bin\LvKSyncClient.exe" --host %HOST% --port %PORT% --slot 3 --index 2 --local-keys S,F,D,A,G,H
+
+echo.
+echo 終了しました。
 pause
