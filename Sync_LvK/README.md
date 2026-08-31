@@ -71,6 +71,18 @@
 
 ---
 
+## よくある間違い
+
+**プレイヤー番号（`--slot`）と、このPCの何番目のゲームか（`--index`）は別物です。**
+
+普通の対戦では**全員が `--index 0`** です。各自のPCでゲームは1つだけだからです。
+2P だからといって `--index 1` にはしません。`start_client_pN.cmd` は
+`--index 0` になっているのでそのまま使えます。
+
+1台で複数のゲームを動かして試すときだけ `localtest_pN.cmd` を使ってください。
+
+---
+
 ## 操作キー
 
 | | 移動 | ボタンA | ボタンB |
@@ -164,8 +176,9 @@ Sync_LvK/
   Client/                  プレイヤー用
     bin/LvKSyncClient.exe
     bin/SyncLvK.exe
-    start_client_p1〜p4.cmd
-    start_games.cmd        動作テスト用（1台でゲーム2つ起動）
+    start_client_p1〜p4.cmd   本番用（各自のPCで1ゲーム）
+    localtest_p1〜p4.cmd      検証用（1台で複数ゲームを動かすとき）
+    start_games.cmd           検証用（1台でゲーム2つ起動）
     README.md              ← プレイヤーはこれを読む
   src/                     ソース
   build.cmd                ビルド

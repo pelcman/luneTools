@@ -10,6 +10,8 @@ echo ==========================================================
 echo.
 echo   あなたの操作キー :  Q W E R  と  T Y
 echo.
+echo   このPCで動いているゲーム1つに接続します。
+echo.
 echo ----------------------------------------------------------
 echo   準備できていますか
 echo ----------------------------------------------------------
@@ -41,13 +43,13 @@ if not defined GAMEFOUND (
 echo.
 echo ----------------------------------------------------------
 echo.
-set /p HOST=サーバーのIPを入力して Enter ^(自分のPCなら空Enter^): 
+set /p HOST=サーバーのIPを入力して Enter ^(自分のPCなら空Enter^):
 if "%HOST%"=="" set HOST=127.0.0.1
 echo.
 echo   %HOST%:%PORT% に接続します...
 echo.
 
-"%~dp0bin\LvKSyncClient.exe" --host %HOST% --port %PORT% --slot 2 --index 1 --local-keys W,R,E,Q,T,Y
+"%~dp0bin\LvKSyncClient.exe" --host %HOST% --port %PORT% --slot 2 --index 0 --local-keys W,R,E,Q,T,Y
 
 echo.
 echo 終了しました。

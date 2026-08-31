@@ -27,6 +27,7 @@ namespace LvKSync
         private static long _rxCount, _txCount;
         private static int _mySlot;
         private static volatile int _rttMs = -1;
+        private static int _mySlotWanted;
         private static readonly Stopwatch _clock = Stopwatch.StartNew();
 
         private static void Usage()
@@ -151,6 +152,7 @@ namespace LvKSync
                 }
             }
 
+            _mySlotWanted = slot;
             var games = Util.FindGames();
             if (listOnly)
             {
@@ -186,11 +188,25 @@ namespace LvKSync
             // --- ゲームプロセス ---
             if (pid == 0)
             {
-                Console.Write("RPG_RT を待っています");
-                while (!_stop)
+                if (index > 0)
+                    Console.WriteLine("このPCの {0} 番目のゲームを待っています (--index {1})", index + 1, index);
+                else
+                    Console.Write("ゲームの起動を待っています");
+                bool warned = false;
+                for (int waited = 0; !_stop; waited++)
                 {
                     games = Util.FindGames();
                     if (games.Count > index) { pid = games[index].Id; break; }
+                    if (index > 0 && games.Count > 0 && !warned && waited > 6)
+                    {
+                        warned = true;
+                        Console.WriteLine();
+                        Console.WriteLine("  ゲームは {0} つ動いていますが、{1} 番目を指定しています。",
+                            games.Count, index + 1);
+                        Console.WriteLine("  1台でゲームを1つだけ動かす場合は --index 0 にしてください。");
+                        Console.WriteLine("  ({0}P で遊ぶことと、このPCの何番目のゲームかは別の話です)", _mySlotWanted);
+                        Console.Write("  待機中");
+                    }
                     Console.Write(".");
                     Thread.Sleep(700);
                 }
