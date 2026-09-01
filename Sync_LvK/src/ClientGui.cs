@@ -304,7 +304,9 @@ namespace LvKSync
             while (!_stop)
             {
                 int want = _checkWanted;
-                if (want == done || want <= 0) { Thread.Sleep(2); continue; }
+                // 1ms ごとに見る。回し続けると入力を扱うループを圧迫して
+                // フレームを見逃すようになる (実測で見逃しが 0 -> 3000 に増えた)。
+                if (want == done || want <= 0) { Thread.Sleep(1); continue; }
                 done = want;
                 var mem = _mem;
                 if (mem == null) { Thread.Sleep(5); continue; }
