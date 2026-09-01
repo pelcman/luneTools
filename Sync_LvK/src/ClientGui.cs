@@ -42,6 +42,15 @@ namespace LvKSync
         private const int StaleFrameGap = 600;
 
         /// <summary>
+        /// マスクのビット (左,上,下,右,A,B) を、ゲームの入力ブロックの並びへ移す表。
+        ///
+        /// 実測すると、ブロックの並びは 下,左,右,上,A,B だった。
+        /// キャラ選択でカーソルの列と行 (V[10001], V[10002]) がどう動くかで確かめている。
+        /// ここを取り違えると、上を押すと左へ行くような食い違いになる。
+        /// </summary>
+        private static readonly int[] SlotOfButton = { 1, 3, 0, 2, 4, 5 };
+
+        /// <summary>
         /// 何フレーム先ぶんを前もって書いておくか。
         /// ゲームはフレームの頭で入力を読むので、tick が変わってから書くと
         /// 読み終えた後になることがある。先に置いておけば競争にならない。
@@ -685,7 +694,7 @@ namespace LvKSync
                         if (haveWritten && mk == lastWritten[s - 1]) continue;
                         int b = NetBase + (s - 1) * Buttons;
                         for (int i = 0; i < Buttons; i++)
-                            mem.WriteVar(b + i, ((mk >> i) & 1));
+                            mem.WriteVar(b + SlotOfButton[i], ((mk >> i) & 1));
                         lastWritten[s - 1] = mk;
                     }
                     haveWritten = true;
@@ -765,7 +774,7 @@ namespace LvKSync
                         if (haveWritten && mk == lastWritten[s - 1]) continue;
                         int b = NetBase + (s - 1) * Buttons;
                         for (int i = 0; i < Buttons; i++)
-                            mem.WriteVar(b + i, ((mk >> i) & 1));
+                            mem.WriteVar(b + SlotOfButton[i], ((mk >> i) & 1));
                         lastWritten[s - 1] = mk;
                     }
                     haveWritten = true;
@@ -1396,10 +1405,13 @@ namespace LvKSync
             {
                 var nb = new StringBuilder("  ゲームのメモリ V[");
                 nb.Append(_engine.NetBase).Append("..").Append(_engine.NetBase + v.Length - 1).Append("] = ");
+                // 並べ替えて 左上下右AB の順で見せる (ブロックの生の並びは 下左右上AB)
+                int[] slotOf = { 1, 3, 0, 2, 4, 5 };
                 for (int s = 0; s < Proto.MaxPlayers; s++)
                 {
                     nb.Append(s + 1).Append("P:");
-                    for (int b = 0; b < Buttons; b++) nb.Append(v[s * Buttons + b] != 0 ? "1" : "0");
+                    for (int b = 0; b < Buttons; b++)
+                        nb.Append(v[s * Buttons + slotOf[b]] != 0 ? "1" : "0");
                     nb.Append("  ");
                 }
                 _netLine.Text = nb.ToString();
