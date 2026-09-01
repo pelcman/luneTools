@@ -773,11 +773,14 @@ namespace LvKSync
                         if (Util.KeyDown(Keys[i])) mask |= (ushort)(1 << i);
                     LocalMask = mask;
 
+                    // 全員そろうまでは、誰の操作も一切通さない。
+                    //
+                    // ここで自分だけローカルに動かせるようにすると、
+                    // キャラ選択が同期しないまま各自が進んでしまい、
+                    // 別のキャラで試合が始まってしまう。
+                    // 全員がタイトルで止まって待ち、そろってから一緒に動かす。
                     bool shared = Ready && AllReady;
 
-                    // 準備できていないあいだは、自分の操作を外へ出さない。
-                    // 出すと、まだタイトルにいる人の↓や決定が、
-                    // すでにキャラ選択にいる人のカーソルを動かしてしまう。
                     var pkt = Proto.Build(Proto.MsgInput,
                         Proto.InputPayload(MySlot, 0, shared ? mask : (ushort)0));
                     try { lock (st) st.Write(pkt, 0, pkt.Length); TxCount++; }
@@ -786,10 +789,7 @@ namespace LvKSync
                     var cur = RemoteMasks;
                     for (int s = 1; s <= Proto.MaxPlayers; s++)
                     {
-                        // 準備前は自分のキーだけを自分のゲームに通す。
-                        // こうしないと、パッチ済みのゲームでは自分のメニュー操作もできない。
-                        ushort mk = shared ? cur[s - 1]
-                                           : (s == MySlot ? mask : (ushort)0);
+                        ushort mk = shared ? cur[s - 1] : (ushort)0;
                         if (haveWritten && mk == lastWritten[s - 1]) continue;
                         int b = NetBase + (s - 1) * Buttons;
                         for (int i = 0; i < Buttons; i++)
@@ -1375,7 +1375,7 @@ namespace LvKSync
             {
                 if (!_engine.Ready)
                 {
-                    _big.Text = "  あなたは " + my + "P です  ―  準備できたら「準備完了」を押してください";
+                    _big.Text = "  あなたは " + my + "P です  ―  「準備完了」を押すまでゲームは動かせません";
                     _big.ForeColor = Color.FromArgb(190, 120, 20);
                 }
                 else if (!_engine.AllReady)
@@ -1456,7 +1456,7 @@ namespace LvKSync
         /// <summary>起動引数で画面の初期値を埋める。--start があればそのまま接続する。</summary>
         private void ApplyArgs(string[] args)
         {
-            bool auto = false;
+            bool auto = false, autoReady = false;
             for (int i = 0; i < args.Length; i++)
             {
                 string a = args[i];
@@ -1492,11 +1492,23 @@ namespace LvKSync
                     case "--apply-own": _applyOwn.Checked = true; break;
                     case "--game": if (nx != null) { _game.Text = nx; i++; } break;
                     case "--no-launch": _launch.Checked = false; break;
+                    case "--ready": autoReady = true; break;
                     case "--throttle": _engine.ThrottleAhead = true; break;
                 }
             }
             SyncKeyBox();
             if (auto) Shown += delegate { OnToggle(this, EventArgs.Empty); };
+            if (autoReady)
+            {
+                // 検証用。つながったら自動で準備完了にする。
+                var t = new WinTimer { Interval = 1000 };
+                t.Tick += delegate
+                {
+                    if (_engine.Running && _engine.MySlot > 0 && !_engine.Ready)
+                    { _engine.SetReady(true); t.Stop(); RefreshAll(); }
+                };
+                Shown += delegate { t.Start(); };
+            }
         }
 
         [STAThread]
