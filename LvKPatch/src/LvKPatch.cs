@@ -258,6 +258,12 @@ namespace LvKPatch
             }
             if (todo == 0) { Say("書き換える箇所がありません。"); Say(""); return; }
 
+            // どこを書き換えるのかを、必ず先に見せる
+            Say("");
+            Say(_makeCopy.Checked
+                ? "コピーを作って当てます。元のフォルダは触りません。"
+                : "【注意】元のフォルダをそのまま書き換えます: " + folder);
+
             // コピーを作る場合は、以降はコピー側を書き換える
             if (_makeCopy.Checked)
             {
@@ -387,7 +393,13 @@ namespace LvKPatch
                 switch (a)
                 {
                     case "--folder": if (nx != null) { _folder.Text = nx; SuggestDest(); i++; } break;
-                    case "--dest": if (nx != null) { _dest.Text = nx; i++; } break;
+                    // --dest を渡したら、コピーを作る意思表示とみなす。
+                    // 画面の設定は保存されるので、前に --in-place で使っていると
+                    // 「コピーを作らない」が残ったままになる。それに気づかず
+                    // --dest 付きで走らせて、原本のほうを書き換えてしまった。
+                    case "--dest":
+                        if (nx != null) { _dest.Text = nx; _makeCopy.Checked = true; i++; }
+                        break;
                     case "--in-place": _makeCopy.Checked = false; break;
                     case "--netbase": if (nx != null) { _netbase.Text = nx; i++; } break;
                     case "--apply": apply = true; break;

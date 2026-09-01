@@ -142,6 +142,16 @@ namespace LvKSync
         private int _resetPulseLeft;
         private volatile bool _wantReset;
         private bool _heldForJoin;
+        private int _lastResult = -1;
+        private double _stallFrom = -1, _resultDue;
+        private bool _resultPrevAny;
+        private int _resultPulse;
+
+        /// <summary>結果画面を進める合図を、何フレーム押し続けるか。</summary>
+        private const int ResultPulseFrames = 6;
+
+        /// <summary>これだけ止まっていたら、試合ではなく結果画面とみなす。</summary>
+        private const double StallMs = 500;
         private static readonly ushort[] ZeroMasks = new ushort[Proto.MaxPlayers];
 
         /// <summary>いま何をしているか。画面に出す。</summary>
@@ -271,6 +281,7 @@ namespace LvKSync
             MySlot = 0; RttMs = -1; TxCount = 0; RxCount = 0; VarBase = 0; Pid = 0;
             SelState = Proto.SelUnknown; SelStable = 0; SelHash = 0; SelPeers = 0;
             Where = ""; _heldForJoin = false; _resetPulseLeft = 0; _wantReset = false;
+            _lastResult = -1; _stallFrom = -1; _resultPulse = 0; _resultPrevAny = false;
             _serverFrame = -1; AppliedFrame = 0; FrameLag = 0; InMatch = false; StallCount = 0;
             _matchBase = int.MinValue; _gameFrame = 0;
             _minGameFrame = 0; _maxGameFrame = 0; _sendDelay = 0;
@@ -484,6 +495,79 @@ namespace LvKSync
             new Thread(PingLoop) { IsBackground = true }.Start();
 
             MainLoop(needIndex);
+        }
+
+        /// <summary>
+        /// 試合が終わったあとの「Press Z key」を、全員そろって進める。
+        ///
+        /// ここはゲームが自分のキーボードを直接読んでいた場所で、そのままだと
+        /// 押した人のゲームだけが先にキャラ選択へ行ってしまう。実際、片方で
+        /// Z を押すとそちらだけ次の試合まで進み、もう片方は結果画面のまま残った。
+        ///
+        /// パッチで読み先を V[netbase+45] に変えてあるので、配られた入力から書く。
+        /// 誰の決定でも進む。入力はもともと全員へ同じものが配られているので、
+        /// 新しいやりとりを足さなくても足並みがそろう。
+        ///
+        /// **毎回まわすこと。** 試合が終わると V[654] が止まるので、
+        /// フレームを鍵にした経路はこの画面では動かない。
+        /// </summary>
+        /// <summary>誰かが決定を押しているか。届いている入力から見る。</summary>
+        private bool AnyDecide()
+        {
+            var cur = RemoteMasks;
+            for (int i = 0; i < Proto.MaxPlayers; i++)
+                if ((cur[i] & (1 << 4)) != 0) return true;   // A ボタン
+            return false;
+        }
+
+        private void ResultStall(GameMemory mem, NetworkStream st,
+                                 Stopwatch pacer, double frameMs)
+        {
+            double now = pacer.Elapsed.TotalMilliseconds;
+            if (_stallFrom < 0)
+            {
+                _stallFrom = now;
+                _resultDue = now;
+                // 止まった時点で押されているボタンは「押し直し」と見なさない。
+                // 攻撃ボタンを押したまま試合が終わることが普通にあるので、
+                // ここを見ておかないと結果画面が一瞬で飛ぶ。
+                _resultPrevAny = AnyDecide();
+                _resultPulse = 0;
+                return;
+            }
+            // 一瞬止まっただけ (ヒットストップなど) では動かさない
+            if (now - _stallFrom < StallMs) return;
+            if (now < _resultDue) return;
+            _resultDue = now + frameMs;
+
+            // 自分の入力を送る。試合中の経路はフレームが進まないと送らないので、
+            // ここで送らないと、誰の決定も相手のクライアントに届かない。
+            ushort mask = 0;
+            for (int i = 0; i < Buttons; i++)
+                if (Util.KeyDown(Keys[i])) mask |= (ushort)(1 << i);
+            LocalMask = mask;
+            try
+            {
+                var pkt = Proto.Build(Proto.MsgInput, Proto.InputPayload(MySlot, 0, mask));
+                lock (st) st.Write(pkt, 0, pkt.Length);
+                TxCount++;
+            }
+            catch { }
+
+            // 届いている入力から、結果画面を進める合図を書く。
+            // 押しっぱなしではなく「押し直し」で進める。
+            bool any = AnyDecide();
+            if (any && !_resultPrevAny) _resultPulse = ResultPulseFrames;
+            _resultPrevAny = any;
+
+            int v = 0;
+            if (_resultPulse > 0) { v = Patcher.ResultKeyCode; _resultPulse--; }
+            if (v != _lastResult)
+            {
+                _lastResult = v;
+                mem.WriteVar(NetBase + Patcher.ResultKeyOffset, v);
+            }
+            Where = "試合が終わりました  決定で次へ";
         }
 
         /// <summary>
@@ -1018,7 +1102,16 @@ namespace LvKSync
                     // ゲームが1フレーム進むごとに、自分の入力を DelayFrames 先のフレーム宛に送り、
                     // このフレーム宛に届いている入力を当てる。実時間は一切使わないのでずれない。
                     // フレームの変わり目を逃さないよう、譲らずに短く回して待つ
-                    if (tick == lastTick) { Thread.SpinWait(60); continue; }
+                    if (tick == lastTick)
+                    {
+                        // 試合が終わると V[654] は止まる。ここから下は
+                        // フレームが進まないと何もしないので、
+                        // 結果画面のぶんだけ別に回す。
+                        ResultStall(mem, st, pacer, frameMs);
+                        Thread.SpinWait(60);
+                        continue;
+                    }
+                    _stallFrom = -1;
 
                     if (!InMatch || lastTick < 0 || tick < lastTick)
                     {
