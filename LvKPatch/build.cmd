@@ -9,7 +9,7 @@ if not exist "%CSC%" (
 if not exist "%~dp0bin" mkdir "%~dp0bin"
 
 echo bin\LvKPatch.exe
-"%CSC%" -nologo -platform:x64 -optimize+ -target:winexe -r:System.Windows.Forms.dll -r:System.Drawing.dll -out:"%~dp0bin\LvKPatch.exe" "%~dp0src\LvKPatch.cs"
+"%CSC%" -nologo -platform:x64 -optimize+ -target:winexe -r:System.Windows.Forms.dll -r:System.Drawing.dll -out:"%~dp0bin\LvKPatch.exe" "%~dp0..\Sync_LvK\src\GamePatch.cs" "%~dp0src\LvKPatch.cs"
 if errorlevel 1 goto :fail
 
 echo.

@@ -7,6 +7,7 @@
 //   V[netbase + (slot-1)*6 + 0..5] = 左, 上, 下, 右, A, B   (各 0 か 1)
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -84,6 +85,12 @@ namespace LvKSync
         public int WantSlot;
         public int NetBase = 9001;
         public int GameIndex;
+
+        /// <summary>ゲームの RPG_RT.exe の場所。空なら起動中のものを探す。</summary>
+        public string GamePath = "";
+
+        /// <summary>接続するときにゲームを自分で起動するか。</summary>
+        public bool LaunchGame;
         public int DelayFrames = 2;
         public bool ApplyOwn;
         public int[] Keys = new int[Buttons];
@@ -214,15 +221,75 @@ namespace LvKSync
 
         private void WorkCore()
         {
-            // --- ゲームを待つ ---
-            Phase = "ゲームの起動を待っています";
-            Say("ゲーム (RPG_RT.exe) の起動を待っています…");
-            Bump();
+            // --- ゲームを用意する ---
             int pid = 0;
-            while (!_stop)
+
+            // 場所が分かっているなら自分で起動して、そのプロセスを掴む。
+            // 「このPCの何番目のゲームか」を当てにいかずに済む。
+            if (LaunchGame && !string.IsNullOrEmpty(GamePath))
+            {
+                Phase = "ゲームを起動しています";
+                Bump();
+                if (!File.Exists(GamePath))
+                {
+                    Say("[WARN] ゲームが見つかりません: " + GamePath);
+                    Say("       「ゲーム」の欄で RPG_RT.exe を選び直してください。");
+                    return;
+                }
+                try
+                {
+                    var psi = new System.Diagnostics.ProcessStartInfo(GamePath);
+                    psi.WorkingDirectory = Path.GetDirectoryName(GamePath);
+                    psi.UseShellExecute = false;
+                    var proc = System.Diagnostics.Process.Start(psi);
+                    Say("ゲームを起動しました  " + GamePath);
+                    for (int i = 0; i < 100 && !_stop; i++)
+                    {
+                        proc.Refresh();
+                        if (proc.HasExited) break;
+                        if (proc.MainWindowHandle != IntPtr.Zero) break;
+                        Thread.Sleep(200);
+                    }
+                    if (proc.HasExited)
+                    {
+                        Say("[WARN] ゲームがすぐ終了しました。フォルダを確認してください。");
+                        return;
+                    }
+                    pid = proc.Id;
+                }
+                catch (Exception ex)
+                {
+                    Say("[WARN] ゲームを起動できませんでした: " + ex.Message);
+                    return;
+                }
+            }
+
+            // --- 起動中のゲームを探す ---
+            Phase = "ゲームの起動を待っています";
+            if (pid == 0) Say("ゲーム (RPG_RT.exe) の起動を待っています…");
+            Bump();
+            bool warned = false;
+            int waited = 0;
+            while (pid == 0 && !_stop)
             {
                 var games = Util.FindGames();
                 if (games.Count > GameIndex) { pid = games[GameIndex].Id; break; }
+
+                // ゲームは動いているのに待ち続けるのは、たいてい
+                // 「このPCの何番目のゲームか」が 0 でないため。
+                if (!warned && games.Count > 0 && ++waited > 5)
+                {
+                    warned = true;
+                    Phase = "設定を確認してください";
+                    Say(string.Format(
+                        "[WARN] ゲームは {0} つ動いていますが、{1} つ目を待っています。",
+                        games.Count, GameIndex + 1));
+                    Say("       詳細設定の「このPCの何番目のゲームか」が " + GameIndex + " になっています。");
+                    Say("       1台でゲームを1つだけ動かすなら 0 にしてください。");
+                    Say("       上の「ゲーム」欄で RPG_RT.exe を指定しておくと、");
+                    Say("       クライアントが自分で起動して掴むので、この設定は不要です。");
+                    Bump();
+                }
                 Thread.Sleep(600);
             }
             if (_stop) return;
@@ -691,6 +758,9 @@ namespace LvKSync
         private readonly Panel _advPanel = new Panel();
         private readonly TextBox _netbase = new TextBox();
         private readonly TextBox _index = new TextBox();
+        private readonly TextBox _game = new TextBox();
+        private readonly Button _browseGame = new Button();
+        private readonly CheckBox _launch = new CheckBox();
         private readonly ComboBox _keyMode = new ComboBox();
         private readonly TextBox _keys = new TextBox();
         private readonly CheckBox _applyOwn = new CheckBox();
@@ -712,8 +782,8 @@ namespace LvKSync
                 "LvKSyncClient.ini");
 
             Text = "LvKSync プレイヤー";
-            ClientSize = new Size(680, 640);
-            MinimumSize = new Size(620, 560);
+            ClientSize = new Size(700, 680);
+            MinimumSize = new Size(660, 600);
             Font = new Font("Yu Gothic UI", 9F);
             StartPosition = FormStartPosition.CenterScreen;
 
@@ -818,7 +888,7 @@ namespace LvKSync
             Controls.Add(_advPanel);
 
             // 接続設定
-            var top = new Panel { Dock = DockStyle.Top, Height = 82 };
+            var top = new Panel { Dock = DockStyle.Top, Height = 118 };
             top.Controls.Add(Lab("名前", 10, 12));
             _name.SetBounds(56, 8, 180, 24);
             _name.MaxLength = 12;
@@ -833,26 +903,39 @@ namespace LvKSync
             _port.Text = "47801";
             top.Controls.Add(_port);
 
-            top.Controls.Add(Lab("プレイヤー番号", 10, 48));
-            _slot.SetBounds(112, 44, 124, 24);
+            // ゲームの場所 (ここを埋めておけばクライアントが起動まで面倒を見る)
+            top.Controls.Add(Lab("ゲーム", 10, 48));
+            _game.SetBounds(56, 44, 452, 24);
+            top.Controls.Add(_game);
+            _browseGame.SetBounds(514, 43, 70, 26);
+            _browseGame.Text = "参照…";
+            _browseGame.Click += OnBrowseGame;
+            top.Controls.Add(_browseGame);
+            _launch.SetBounds(590, 46, 76, 22);
+            _launch.Text = "起動する";
+            _launch.Checked = true;
+            top.Controls.Add(_launch);
+
+            top.Controls.Add(Lab("プレイヤー番号", 10, 84));
+            _slot.SetBounds(112, 80, 124, 24);
             _slot.DropDownStyle = ComboBoxStyle.DropDownList;
             _slot.Items.AddRange(new object[] { "おまかせ", "1P", "2P", "3P", "4P" });
             _slot.SelectedIndex = 0;
             _slot.SelectedIndexChanged += delegate { SyncKeyBox(); };
             top.Controls.Add(_slot);
 
-            top.Controls.Add(Lab("入力遅延", 250, 48));
-            _delay.SetBounds(310, 44, 50, 24);
+            top.Controls.Add(Lab("入力遅延", 250, 84));
+            _delay.SetBounds(310, 80, 50, 24);
             _delay.Minimum = 0; _delay.Maximum = 15; _delay.Value = 2;
             top.Controls.Add(_delay);
-            top.Controls.Add(Lab("フレーム", 364, 48));
+            top.Controls.Add(Lab("フレーム", 364, 84));
 
-            _advanced.SetBounds(430, 46, 76, 22);
+            _advanced.SetBounds(430, 82, 76, 22);
             _advanced.Text = "詳細設定";
             _advanced.CheckedChanged += delegate { _advPanel.Visible = _advanced.Checked; };
             top.Controls.Add(_advanced);
 
-            _btn.SetBounds(560, 43, 100, 26);
+            _btn.SetBounds(560, 79, 100, 26);
             _btn.Text = "接続";
             _btn.Click += OnToggle;
             top.Controls.Add(_btn);
@@ -864,6 +947,23 @@ namespace LvKSync
         private static Label Lab(string t, int x, int y)
         {
             return new Label { Text = t, AutoSize = true, Left = x, Top = y };
+        }
+
+        private void OnBrowseGame(object sender, EventArgs e)
+        {
+            using (var d = new OpenFileDialog())
+            {
+                d.Title = "ゲームの RPG_RT.exe を選んでください";
+                d.Filter = "RPG_RT.exe|RPG_RT.exe|実行ファイル (*.exe)|*.exe";
+                try
+                {
+                    string cur = _game.Text.Trim();
+                    if (cur.Length > 0 && File.Exists(cur))
+                        d.InitialDirectory = Path.GetDirectoryName(cur);
+                }
+                catch { }
+                if (d.ShowDialog(this) == DialogResult.OK) _game.Text = d.FileName;
+            }
         }
 
         #endregion
@@ -881,8 +981,12 @@ namespace LvKSync
             int d = ini.GetInt("delay", 2);
             _delay.Value = Math.Max(0, Math.Min(15, d));
             _netbase.Text = ini.GetInt("netbase", 9001).ToString();
-            _index.Text = ini.GetInt("index", 0).ToString();
+            // 同一PCで複数のゲームを動かす検証用の設定。
+            // 普通の対戦では必ず 0 なので、保存された値は引き継がない。
+            _index.Text = "0";
             _applyOwn.Checked = ini.GetBool("applyown", true);
+            _game.Text = ini.Get("game", "");
+            _launch.Checked = ini.GetBool("launch", true);
             string lk = ini.Get("localkeys", "");
             if (!string.IsNullOrEmpty(lk))
             {
@@ -904,8 +1008,10 @@ namespace LvKSync
                 sb.AppendLine("slot = " + _slot.SelectedIndex);
                 sb.AppendLine("delay = " + (int)_delay.Value);
                 sb.AppendLine("netbase = " + _netbase.Text.Trim());
-                sb.AppendLine("index = " + _index.Text.Trim());
+                sb.AppendLine("index = 0");
                 sb.AppendLine("applyown = " + (_applyOwn.Checked ? "1" : "0"));
+                sb.AppendLine("game = " + _game.Text.Trim());
+                sb.AppendLine("launch = " + (_launch.Checked ? "1" : "0"));
                 sb.AppendLine("localkeys = " + (_keyMode.SelectedIndex == 5 ? _keys.Text.Trim() : ""));
                 File.WriteAllText(_iniPath, sb.ToString(), new UTF8Encoding(true));
             }
@@ -984,6 +1090,11 @@ namespace LvKSync
             _engine.GameIndex = index;
             _engine.ApplyOwn = _applyOwn.Checked;
             _engine.Keys = keys;
+            _engine.GamePath = _game.Text.Trim();
+            _engine.LaunchGame = _launch.Checked;
+
+            // ゲームにパッチが当たっているか確かめる。無ければここで当てる。
+            if (!EnsurePatched(_engine.GamePath, netbase)) return;
 
             SaveSettings();
             _engine.Start();
@@ -992,9 +1103,77 @@ namespace LvKSync
             RefreshAll();
         }
 
+        /// <summary>
+        /// ゲームにネットワーク入力の受け取りが入っているか確かめ、
+        /// 入っていなければ当てるか尋ねる。当てない選択なら false を返す。
+        /// </summary>
+        private bool EnsurePatched(string exePath, int netbase)
+        {
+            if (string.IsNullOrEmpty(exePath)) return true;
+            string ldb;
+            try { ldb = Path.Combine(Path.GetDirectoryName(exePath), "RPG_RT.ldb"); }
+            catch { return true; }
+            if (!File.Exists(ldb)) return true;      // 判断できないので通す
+
+            byte[] buf;
+            List<Group> groups;
+            try
+            {
+                buf = File.ReadAllBytes(ldb);
+                groups = Patcher.FindGroups(buf);
+            }
+            catch { return true; }
+
+            int todo = 0, done = 0;
+            foreach (var g in groups) { if (g.Patched) done++; else todo++; }
+            if (todo == 0)
+            {
+                if (done > 0) AppendLog("ゲームはパッチ済みです。");
+                return true;
+            }
+
+            var r = MessageBox.Show(
+                "このゲームにはネットワーク入力の受け取りが入っていません。\n" +
+                "いま入れますか。\n\n" +
+                ldb + "\n\n" +
+                "元のファイルは RPG_RT.ldb.bak として残します。\n" +
+                "「いいえ」を選ぶと、ネットワーク越しの操作は効きません。",
+                "パッチが必要です", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r != DialogResult.Yes)
+            {
+                AppendLog("パッチを当てずに続けます。ネットワーク越しの操作は効きません。");
+                return true;
+            }
+
+            try
+            {
+                string bak = ldb + ".bak";
+                if (!File.Exists(bak)) File.Copy(ldb, bak);
+                int applied = 0;
+                foreach (var g in groups)
+                {
+                    if (g.Patched) continue;
+                    var blob = Patcher.MakeReplacement(g, netbase);
+                    Buffer.BlockCopy(blob, 0, buf, g.Offset, blob.Length);
+                    Patcher.Verify(buf, g);
+                    applied++;
+                }
+                File.WriteAllBytes(ldb, buf);
+                AppendLog(string.Format("パッチを当てました ({0} 箇所)。退避: {1}", applied, bak));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("パッチを当てられませんでした。\n\n" + ex.Message,
+                    "LvKSync", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            return true;
+        }
+
         private void SetInputs(bool on)
         {
             _name.Enabled = on; _host.Enabled = on; _port.Enabled = on;
+            _game.Enabled = on; _browseGame.Enabled = on; _launch.Enabled = on;
             _slot.Enabled = on; _keyMode.Enabled = on; _netbase.Enabled = on;
             _index.Enabled = on; _applyOwn.Enabled = on;
             _keys.Enabled = on;
@@ -1122,6 +1301,8 @@ namespace LvKSync
                         if (nx != null) { _keyMode.SelectedIndex = 5; _keys.Text = nx; i++; }
                         break;
                     case "--apply-own": _applyOwn.Checked = true; break;
+                    case "--game": if (nx != null) { _game.Text = nx; i++; } break;
+                    case "--no-launch": _launch.Checked = false; break;
                     case "--throttle": _engine.ThrottleAhead = true; break;
                 }
             }
