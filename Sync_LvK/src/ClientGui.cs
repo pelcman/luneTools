@@ -110,6 +110,51 @@ namespace LvKSync
         public bool ApplyOwn;
         public int[] Keys = new int[Buttons];
 
+        /// <summary>設定メニューを開け閉めするキー。ゲーム本来の Shift に合わせてある。</summary>
+        public int MenuKey = 0x10;
+
+        // --- 設定メニュー (キャラ選択で Shift) ---
+        //
+        // ゲーム側のキー読みをパッチで潰してあるので、ここから入れてやらないと
+        // 誰もメニューを開けない。逆に、ここから入れれば全員が同時に開く。
+        //
+        // メニューを開いている間、ゲームは1フレームずつ進む小さなループに入り、
+        // ほかは何も動かなくなる。開け閉めを1台でも取りこぼすと、その1台だけが
+        // 取り残されて必ずずれる。だから開く・閉じるの合図は全員へ配り、
+        // 受け取った側はしばらく押し続ける (二重に効くことはない)。
+        //
+        // カーソル移動は 1P のゲームにだけ入れて、ほかへは「動いたあとの値」を
+        // そのまま配って上書きする。取りこぼしても次のフレームで直るので、
+        // 押した回数を数えるより確実。ゲームのメニューはもともと 1P の
+        // キーしか受け付けないので、1P を正とするのは元の作りとも合っている。
+
+        /// <summary>受け取った合図を押し続けるフレーム数。</summary>
+        private const int MenuPulseFrames = 8;
+
+        /// <summary>1回の押しで自分のゲームへ入れる上限フレーム。効いたら早く抜ける。</summary>
+        private const int MenuStepCap = 4;
+
+        /// <summary>押しっぱなしのときに繰り返す間隔。</summary>
+        private const int MenuRepeatFrames = 9;
+
+        /// <summary>設定メニューが開いているか。全員で同じになる。</summary>
+        public volatile bool MenuOpen;
+
+        /// <summary>いまの設定の値。1P のものが正。</summary>
+        public volatile int[] MenuValues = new int[Proto.MenuValueCount];
+
+        private readonly bool[] _menuWasDown = new bool[Buttons + 1];
+        private readonly int[] _menuHeldFor = new int[Buttons + 1];
+        private int _menuStepCode, _menuStepLeft;
+        private readonly int[] _menuStepBefore = new int[Proto.MenuValueCount];
+        private int _pulseKey, _pulseKeyLeft;
+        private int _pulseOpen, _pulseOpenLeft;
+        private int _menuCool;                 // 開け閉めの直後に置く待ち時間
+        private readonly int[] _menuSent = new int[Proto.MenuValueCount];
+        private int _menuHeartbeat;            // 値が変わらなくても、たまに配る
+        private volatile bool _haveMenuValues;
+        private volatile int[] _wantSetting;   // ツール側からの変更要求
+
         /// <summary>ゲームのフレーム番号で並べた入力。_ringFrame はその枠が何フレーム用か。</summary>
         private readonly ushort[][] _ring = new ushort[RingSize][];
         private readonly int[][] _ringFrame = new int[RingSize][];
@@ -391,6 +436,184 @@ namespace LvKSync
         }
 
         /// <summary>
+        /// 設定メニューの面倒を見る。試合外 (キャラ選択) で毎フレーム呼ぶ。
+        /// </summary>
+        private void MenuTick(GameMemory mem, NetworkStream st)
+        {
+            int menuBase = NetBase + Patcher.MenuKeyOffset;
+            int openBase = NetBase + Patcher.MenuOpenOffset;
+
+            // --- 受け取った合図を押し続ける ---
+            if (_pulseOpenLeft > 0)
+            {
+                mem.WriteVar(openBase, _pulseOpen);
+                if (--_pulseOpenLeft == 0) mem.WriteVar(openBase, 0);
+            }
+            if (_pulseKeyLeft > 0)
+            {
+                mem.WriteVar(menuBase, _pulseKey);
+                if (--_pulseKeyLeft == 0) mem.WriteVar(menuBase, 0);
+            }
+
+            if (MySlot != 1)
+            {
+                // 1P 以外は、配られた値をそのまま自分のゲームへ書く。
+                // カーソルも値も毎フレーム上書きするので、押した回数が
+                // 多少ずれても次のフレームで揃う。
+                // メニューを閉じたあとも書き続ける。設定は試合の内容そのものなので、
+                // 閉じた時点で全員が同じ値を持っていないと、始めた瞬間にずれる。
+                if (_haveMenuValues)
+                {
+                    var v = MenuValues;
+                    for (int i = 0; i < Proto.MenuValueCount; i++)
+                        mem.WriteVar(Proto.MenuVars[i], v[i]);
+                }
+                return;
+            }
+
+            // ================= ここから 1P だけ =================
+
+            // 対戦オプション画面からの変更要求
+            var want = _wantSetting;
+            if (want != null)
+            {
+                _wantSetting = null;
+                int wi = want[0];
+                if (wi >= 0 && wi < Proto.MenuValueCount)
+                {
+                    mem.WriteVar(Proto.MenuVars[wi], want[1]);
+                    Say(string.Format("設定を変えました: {0} = {1}",
+                        Proto.MenuVarNames[wi], want[1]));
+                }
+            }
+
+            // いまの値を読む
+            var cur = new int[Proto.MenuValueCount];
+            for (int i = 0; i < Proto.MenuValueCount; i++)
+                cur[i] = mem.ReadVar(Proto.MenuVars[i]);
+            MenuValues = cur;
+            _haveMenuValues = true;
+
+            // 値をほかへ配る。変わったときと、たまの近況報告。
+            // これが正になるので、ほかのインスタンスは押した回数を数えなくてよい。
+            bool changed = false;
+            for (int i = 0; i < Proto.MenuValueCount; i++)
+                if (cur[i] != _menuSent[i]) { changed = true; break; }
+            if (changed || --_menuHeartbeat <= 0)
+            {
+                for (int i = 0; i < Proto.MenuValueCount; i++) _menuSent[i] = cur[i];
+                _menuHeartbeat = 15;
+                SendMenu(st, 0, 0, cur);
+            }
+
+            // --- 自分のゲームへ入れている途中のキーを切る ---
+            // 入れっぱなしにするとゲームは1フレームに1歩ずつ進んでしまうので、
+            // 効いたのが分かった時点で 0 に戻す。効かない場所 (端で止まっている
+            // 値など) のために上限も置く。
+            if (_menuStepLeft > 0)
+            {
+                bool moved = false;
+                for (int i = 0; i < Proto.MenuValueCount; i++)
+                    if (cur[i] != _menuStepBefore[i]) { moved = true; break; }
+                _menuStepLeft--;
+                if (moved || _menuStepLeft <= 0)
+                {
+                    mem.WriteVar(menuBase, 0);
+                    _menuStepLeft = 0;
+                    _menuStepCode = 0;
+                }
+                else
+                {
+                    mem.WriteVar(menuBase, _menuStepCode);
+                }
+            }
+
+            // --- キーを見る ---
+            // 方向は、押した瞬間に1歩、押しっぱなしなら一定間隔で繰り返す。
+            // 決定・キャンセル・Shift は繰り返さない。繰り返すと、開けた指を
+            // 離す前に閉じてしまう (実際そうなって、開いた 150ms 後に閉じた)。
+            int code = 0;
+            for (int i = 0; i <= Buttons; i++)
+            {
+                bool down = Util.KeyDown(i == Buttons ? MenuKey : Keys[i]);
+                bool repeats = i < 4;
+                if (down)
+                {
+                    if (!_menuWasDown[i]) { _menuHeldFor[i] = 0; if (code == 0) code = MenuCodeOf(i); }
+                    else if (repeats && ++_menuHeldFor[i] >= MenuRepeatFrames)
+                    { _menuHeldFor[i] = 0; if (code == 0) code = MenuCodeOf(i); }
+                }
+                _menuWasDown[i] = down;
+            }
+            if (_menuCool > 0) { _menuCool--; return; }
+            if (code == 0) return;
+
+            if (!MenuOpen)
+            {
+                // 閉じているとき、開けるのは Shift だけ
+                if (code != Patcher.MenuOpenCode) return;
+                MenuOpen = true;
+                mem.WriteVar(openBase, Patcher.MenuOpenCode);
+                _pulseOpen = Patcher.MenuOpenCode;
+                _pulseOpenLeft = MenuPulseFrames;
+                SendMenu(st, 0, Patcher.MenuOpenCode, cur);
+                _menuCool = MenuPulseFrames;
+                Say("設定メニューを開きました。全員に配ります。");
+                return;
+            }
+
+            if (code >= 5)
+            {
+                // 決定・キャンセル・Shift はどれもメニューを閉じる。
+                // 閉じる合図だけは全員へ配る。取り残しを作らないため。
+                MenuOpen = false;
+                mem.WriteVar(menuBase, code);
+                _pulseKey = code;
+                _pulseKeyLeft = MenuPulseFrames;
+                SendMenu(st, code, 0, cur);
+                _menuCool = MenuPulseFrames;
+                Say("設定メニューを閉じました。");
+                return;
+            }
+
+            // 方向は自分のゲームにだけ入れる。結果の値はどのみち毎フレーム配る。
+            for (int i = 0; i < Proto.MenuValueCount; i++) _menuStepBefore[i] = cur[i];
+            _menuStepCode = code;
+            _menuStepLeft = MenuStepCap;
+            mem.WriteVar(menuBase, code);
+        }
+
+        /// <summary>
+        /// キーの並び (左,上,下,右,A,B,メニュー) を、ゲームのキーコードに直す。
+        /// ツクールの標準は 1=下 2=左 3=右 4=上 5=決定 6=キャンセル 7=Shift。
+        /// </summary>
+        private static int MenuCodeOf(int i)
+        {
+            switch (i)
+            {
+                case 0: return 2;   // 左
+                case 1: return 4;   // 上
+                case 2: return 1;   // 下
+                case 3: return 3;   // 右
+                case 4: return 5;   // A = 決定
+                case 5: return 6;   // B = キャンセル
+                default: return Patcher.MenuOpenCode;
+            }
+        }
+
+        private void SendMenu(NetworkStream st, int menuKey, int menuOpen, int[] vals)
+        {
+            try
+            {
+                var pk = Proto.Build(Proto.MsgMenu,
+                    Proto.MenuPayload(MySlot, menuKey, menuOpen, vals));
+                lock (st) st.Write(pk, 0, pk.Length);
+                TxCount++;
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// 突き合わせ用の値を計算して送る。
         /// 入力を扱うループを遅らせないよう、別スレッドでゆっくり回す。
         /// </summary>
@@ -453,6 +676,29 @@ namespace LvKSync
                         _ring[m][slot - 1] = mask;
                         _ringFrame[m][slot - 1] = frame;
                     }
+                }
+                else if (type == Proto.MsgMenu)
+                {
+                    int slot, mk, mo;
+                    var vals = new int[Proto.MenuValueCount];
+                    if (Proto.ReadMenu(p, out slot, out mk, out mo, vals))
+                    {
+                        // 1P が配ったものだけを信じる。自分が 1P なら自前のほうが新しい。
+                        if (slot == 1 && MySlot != 1)
+                        {
+                            MenuValues = vals;
+                            _haveMenuValues = true;
+                            if (mo != 0) { _pulseOpen = mo; _pulseOpenLeft = MenuPulseFrames; }
+                            if (mk != 0) { _pulseKey = mk; _pulseKeyLeft = MenuPulseFrames; }
+                            if (mo != 0) MenuOpen = true;
+                            if (mk >= 5) MenuOpen = false;
+                        }
+                    }
+                }
+                else if (type == Proto.MsgSetting && p.Length >= 2)
+                {
+                    // 対戦オプション画面からの変更要求。1P のクライアントだけが従う。
+                    if (MySlot == 1) _wantSetting = new int[] { p[0], p[1] };
                 }
                 else if (type == Proto.MsgRoster)
                 {
@@ -758,9 +1004,15 @@ namespace LvKSync
                     if (behind > frameMs * 4) nextDue = pacer.Elapsed.TotalMilliseconds + frameMs;
                     localFrame++;
 
+                    MenuTick(mem, st);
+
                     ushort mask = 0;
                     for (int i = 0; i < Buttons; i++)
                         if (Util.KeyDown(Keys[i])) mask |= (ushort)(1 << i);
+                    // 設定メニューが開いている間は、キャラ選択のカーソルを動かさない。
+                    // メニューの中で押している方向キーが、メニューに入れていない
+                    // インスタンスのカーソルを動かしてしまうのを防ぐ。
+                    if (MenuOpen) mask = 0;
                     LocalMask = mask;
 
                     var pkt = Proto.Build(Proto.MsgInput, Proto.InputPayload(MySlot, 0, mask));

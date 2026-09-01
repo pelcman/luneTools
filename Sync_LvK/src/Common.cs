@@ -381,8 +381,69 @@ namespace LvKSync
         public const byte MsgPong = 8;     // S->C  [stamp 8]  そのまま返す
         public const byte MsgRoster = 9;   // S->C  誰が何Pに座っているか
         public const byte MsgCheck = 10;   // C->S  [スロット 1][フレーム 4][チェックサム 4]
+        public const byte MsgMenu = 11;    // C->S->全員  設定メニューの状態 (1P が配る)
+        public const byte MsgSetting = 12; // S->C  設定の変更要求 (1P のクライアントが従う)
 
         public const int MaxNameBytes = 24;
+
+        /// <summary>
+        /// 設定メニューで配る変数。ゲームの中を実測して決めた。
+        ///   V[491] メニューのカーソル行 (0..4)
+        ///   V[618] プレイヤー数   V[619] ライフ   V[604] カブ
+        ///   V[617] チーム         V[655] ステージ
+        /// メニューはもともと 1P のキーしか受け付けないので、1P を正とする。
+        /// </summary>
+        public static readonly int[] MenuVars = { 491, 618, 619, 604, 617, 655 };
+
+        public static readonly string[] MenuVarNames =
+            { "カーソル", "プレイヤー", "ライフ", "カブ", "チーム", "ステージ" };
+
+        public static int MenuValueCount { get { return MenuVars.Length; } }
+
+        /// <summary>設定の変更要求で指せる項目。カーソル行は外から動かさない。</summary>
+        public static readonly int[] SettingIndexes = { 1, 2, 3, 4, 5 };
+
+        /// <summary>
+        /// 設定メニューの状態。
+        /// [スロット 1][メニューのキー 1][メニューを開く 1][値 6]
+        ///
+        /// メニューのキーは 1=下 2=左 3=右 4=上 5=決定 6=キャンセル 7=Shift。
+        /// 「メニューを開く」は 7 のときだけ開く。どちらもゲーム側が毎フレーム
+        /// 読むので、押した合図として短く立てて、すぐ 0 に戻す。
+        /// </summary>
+        public static byte[] MenuPayload(int slot, int menuKey, int menuOpen, int[] vals)
+        {
+            var p = new byte[3 + MenuValueCount];
+            p[0] = (byte)slot;
+            p[1] = (byte)menuKey;
+            p[2] = (byte)menuOpen;
+            for (int i = 0; i < MenuValueCount; i++)
+            {
+                int v = (vals != null && i < vals.Length) ? vals[i] : 0;
+                if (v < 0) v = 0;
+                if (v > 255) v = 255;
+                p[3 + i] = (byte)v;
+            }
+            return p;
+        }
+
+        public static bool ReadMenu(byte[] p, out int slot, out int menuKey,
+                                    out int menuOpen, int[] vals)
+        {
+            slot = menuKey = menuOpen = 0;
+            if (p == null || p.Length < 3 + MenuValueCount) return false;
+            slot = p[0]; menuKey = p[1]; menuOpen = p[2];
+            for (int i = 0; i < MenuValueCount; i++) vals[i] = p[3 + i];
+            return true;
+        }
+
+        /// <summary>設定の変更要求。[どの項目 1][値 1]</summary>
+        public static byte[] SettingPayload(int which, int value)
+        {
+            if (value < 0) value = 0;
+            if (value > 255) value = 255;
+            return new byte[] { (byte)which, (byte)value };
+        }
 
         public static byte[] Build(byte type, byte[] payload)
         {

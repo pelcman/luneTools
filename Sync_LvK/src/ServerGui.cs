@@ -282,6 +282,21 @@ namespace LvKSync
                         Trace(string.Format("[INFO] {0}P {1} からの入力が戻りました", peer.Slot, peer.Name));
                     }
                 }
+                else if (type == Proto.MsgMenu)
+                {
+                    // 設定メニューの状態。1P が配り、ほかは合わせる。
+                    int mslot, mkey, mopen;
+                    var vals = new int[Proto.MenuValueCount];
+                    if (Proto.ReadMenu(payload, out mslot, out mkey, out mopen, vals) && mslot == 1)
+                    {
+                        MenuValues = vals;
+                        HaveMenu = true;
+                        if (mopen != 0) { MenuOpen = true; Say("1P が設定メニューを開きました。"); }
+                        if (mkey >= 5) { MenuOpen = false; Say("1P が設定メニューを閉じました。"); }
+                        RelayExcept(Proto.MsgMenu, payload, peer.Slot);
+                        Changed();
+                    }
+                }
                 else if (type == Proto.MsgPing && payload.Length >= 8)
                 {
                     var pong = Proto.Build(Proto.MsgPong, payload);
@@ -358,6 +373,44 @@ namespace LvKSync
                 }
             }
             if (bad != null) Say(bad);
+        }
+
+        /// <summary>設定メニューの値。1P が配ってきたもの。</summary>
+        public volatile int[] MenuValues = new int[Proto.MenuValueCount];
+        public volatile bool HaveMenu;
+        public volatile bool MenuOpen;
+
+        /// <summary>送り主以外へ回す。</summary>
+        private void RelayExcept(byte type, byte[] payload, int fromSlot)
+        {
+            var pkt = Proto.Build(type, payload);
+            var peers = Snapshot();
+            for (int i = 1; i <= Proto.MaxPlayers; i++)
+            {
+                var pr = peers[i];
+                if (pr == null || pr.Slot == fromSlot) continue;
+                try { lock (pr.Stream) pr.Stream.Write(pkt, 0, pkt.Length); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 対戦オプション画面から設定を変える。
+        ///
+        /// 全員へ流すが、従うのは 1P のクライアントだけ。1P のゲームの変数を
+        /// 書き換えると、あとは 1P がふだんどおり値を配るので全員に行き渡る。
+        /// 正を1つに保つため、こちらから直接みんなの値をいじることはしない。
+        /// </summary>
+        public void SendSetting(int which, int value)
+        {
+            var pkt = Proto.Build(Proto.MsgSetting, Proto.SettingPayload(which, value));
+            var peers = Snapshot();
+            for (int i = 1; i <= Proto.MaxPlayers; i++)
+            {
+                if (peers[i] == null) continue;
+                try { lock (peers[i].Stream) peers[i].Stream.Write(pkt, 0, pkt.Length); } catch { }
+            }
+            Say(string.Format("設定を変えるよう 1P へ伝えました: {0} = {1}",
+                Proto.MenuVarNames[which], value));
         }
 
         /// <summary>フレーム番号付きの入力をそのまま全員へ回す。</summary>
@@ -530,6 +583,9 @@ namespace LvKSync
         private readonly WinTimer _timer = new WinTimer();
         private readonly WinTimer _viewTimer = new WinTimer();
         private readonly InputView _view = new InputView();
+        private readonly NumericUpDown[] _opt = new NumericUpDown[5];
+        private readonly Label _optNote = new Label();
+        private bool _optQuiet;
         private FileLogger _log;
         private readonly long[] _lastLoggedRx = new long[Proto.MaxPlayers + 1];
         private int _statTick;
@@ -537,8 +593,8 @@ namespace LvKSync
         public ServerForm()
         {
             Text = "LvKSync サーバー";
-            ClientSize = new Size(760, 720);
-            MinimumSize = new Size(680, 600);
+            ClientSize = new Size(760, 800);
+            MinimumSize = new Size(700, 660);
             Font = new Font("Yu Gothic UI", 9F);
             StartPosition = FormStartPosition.CenterScreen;
 
@@ -588,6 +644,8 @@ namespace LvKSync
                 Text = "  入力の様子  (左が古く、右が今)",
                 TextAlign = ContentAlignment.MiddleLeft
             });
+
+            Controls.Add(BuildOptions());
 
             _list.Dock = DockStyle.Top;
             _list.Height = 152;
@@ -656,7 +714,7 @@ namespace LvKSync
             _engine.RosterChanged += delegate { Post(RefreshList); };
 
             _timer.Interval = 500;
-            _timer.Tick += delegate { RefreshList(); };
+            _timer.Tick += delegate { RefreshList(); RefreshOptions(); };
             _timer.Start();
 
             // 入力の絵はなめらかに動かしたいので、こちらは細かく描き直す
@@ -665,6 +723,79 @@ namespace LvKSync
             _viewTimer.Start();
 
             RefreshList();
+        }
+
+        /// <summary>
+        /// 対戦オプション。ゲームの中の設定メニュー (キャラ選択で Shift) と
+        /// 同じものを、こちらからも変えられるようにしたもの。
+        /// ここで変えると 1P のゲームの変数が書き換わり、そこから全員へ配られる。
+        /// </summary>
+        private Panel BuildOptions()
+        {
+            var pan = new Panel { Dock = DockStyle.Top, Height = 74 };
+            pan.Controls.Add(new Label
+            {
+                Text = "  対戦オプション  (ゲーム内の Shift メニューと同じもの)",
+                AutoSize = true, Left = 4, Top = 4,
+                ForeColor = Color.FromArgb(70, 70, 70)
+            });
+
+            // 名前と、取りうる範囲。実測した値の意味に合わせてある。
+            var names = new string[] { "プレイヤー", "ライフ", "カブ", "チーム", "ステージ" };
+            var mins = new int[] { 1, 1, 0, 0, 0 };
+            var maxs = new int[] { 4, 5, 1, 4, 22 };
+            int x = 8;
+            for (int i = 0; i < _opt.Length; i++)
+            {
+                pan.Controls.Add(new Label
+                { Text = names[i], AutoSize = true, Left = x, Top = 30 });
+                var nud = new NumericUpDown();
+                nud.SetBounds(x, 46, 62, 24);
+                nud.Minimum = mins[i];
+                nud.Maximum = maxs[i];
+                int which = i + 1;             // Proto.MenuVars の 1..5
+                nud.ValueChanged += delegate
+                {
+                    if (_optQuiet || !_engine.Running) return;
+                    _engine.SendSetting(which, (int)((NumericUpDown)_opt[which - 1]).Value);
+                };
+                _opt[i] = nud;
+                pan.Controls.Add(nud);
+                x += Math.Max(76, TextRenderer.MeasureText(names[i], Font).Width + 14);
+            }
+            _optNote.SetBounds(x + 8, 46, 320, 22);
+            _optNote.ForeColor = Color.FromArgb(110, 110, 110);
+            _optNote.Text = "1P がつながると使えます";
+            pan.Controls.Add(_optNote);
+            return pan;
+        }
+
+        /// <summary>1P から届いた値を画面に映す。編集中の欄は触らない。</summary>
+        private void RefreshOptions()
+        {
+            bool have = _engine.Running && _engine.HaveMenu;
+            var v = _engine.MenuValues;
+            _optQuiet = true;
+            try
+            {
+                for (int i = 0; i < _opt.Length; i++)
+                {
+                    _opt[i].Enabled = have;
+                    // NumericUpDown 自身は Focused が false のまま。中の入力欄が
+                    // フォーカスを持つので ContainsFocus で見る。ここを間違えて、
+                    // 変えた値を 0.5 秒ごとに書き戻していた。
+                    if (!have || _opt[i].ContainsFocus) continue;
+                    int val = v[i + 1];
+                    if (val < _opt[i].Minimum) val = (int)_opt[i].Minimum;
+                    if (val > _opt[i].Maximum) val = (int)_opt[i].Maximum;
+                    if ((int)_opt[i].Value != val) _opt[i].Value = val;
+                }
+            }
+            finally { _optQuiet = false; }
+            _optNote.Text = !_engine.Running ? "サーバーを開始すると使えます"
+                : !have ? "1P がつながると使えます"
+                : _engine.MenuOpen ? "1P がゲーム内のメニューを開いています"
+                : "変えると 1P のゲームに反映され、全員に配られます";
         }
 
         private void Post(Action a)

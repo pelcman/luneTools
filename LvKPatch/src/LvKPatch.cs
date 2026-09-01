@@ -158,58 +158,92 @@ namespace LvKPatch
             }
         }
 
-        private bool Prepare(out string ldb, out byte[] buf, out int netbase)
+        /// <summary>書き換える対象のファイル1つぶん。</summary>
+        private sealed class Target
         {
-            ldb = null; buf = null; netbase = Patcher.DefaultNetBase;
-            string f = _folder.Text.Trim();
-            if (f.Length == 0)
+            public string Path;
+            public byte[] Buf;
+            public List<Group> Sites = new List<Group>();
+        }
+
+        private bool Prepare(out string folder, out int netbase)
+        {
+            netbase = Patcher.DefaultNetBase;
+            folder = _folder.Text.Trim();
+            if (folder.Length == 0)
             {
                 MessageBox.Show("ゲームのフォルダを選んでください。", "LvKPatch",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
             }
-            ldb = Patcher.LdbPath(f);
-            if (!File.Exists(ldb))
+            if (!File.Exists(Patcher.LdbPath(folder)))
             {
-                MessageBox.Show("RPG_RT.ldb が見つかりません:\n" + ldb, "LvKPatch",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("RPG_RT.ldb が見つかりません:\n" + Patcher.LdbPath(folder),
+                    "LvKPatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
             }
             if (!int.TryParse(_netbase.Text.Trim(), out netbase) || netbase < 1)
                 netbase = Patcher.DefaultNetBase;
-            buf = File.ReadAllBytes(ldb);
             return true;
+        }
+
+        /// <summary>
+        /// 書き換える場所を全部集める。
+        ///
+        /// いまのところ全部 RPG_RT.ldb の中にある。マップも一応見るが、
+        /// キャラ選択の設定メニューに当たるものは無い (全マップで確認済み)。
+        /// 作者がイベントを動かしたときに追従できるよう、探すだけはしておく。
+        /// </summary>
+        private List<Target> Collect(string folder, int netbase)
+        {
+            var list = new List<Target>();
+
+            var ldb = new Target { Path = Patcher.LdbPath(folder) };
+            ldb.Buf = File.ReadAllBytes(ldb.Path);
+            ldb.Sites.AddRange(Patcher.FindGroups(ldb.Buf));
+            ldb.Sites.AddRange(Patcher.FindMenuSites(ldb.Buf, netbase));
+            ldb.Sites.Sort(delegate (Group a, Group b) { return a.Offset.CompareTo(b.Offset); });
+            list.Add(ldb);
+
+            foreach (string mp in Patcher.MapPaths(folder))
+            {
+                byte[] buf;
+                try { buf = File.ReadAllBytes(mp); }
+                catch { continue; }
+                var t = new Target { Path = mp, Buf = buf };
+                foreach (var g in Patcher.FindMenuSites(buf, netbase))
+                    if (g.Kind == SiteKind.MenuOpen) t.Sites.Add(g);
+                if (t.Sites.Count > 0) list.Add(t);
+            }
+            return list;
         }
 
         private void Run(bool write)
         {
-            string ldb; byte[] buf; int netbase;
-            if (!Prepare(out ldb, out buf, out netbase)) return;
+            string folder; int netbase;
+            if (!Prepare(out folder, out netbase)) return;
 
             Say("──────────────────────────────");
-            Say((write ? "パッチ: " : "確認: ") + ldb);
-            Say(string.Format("{0} バイト   入力ブロック V[{1}..{2}]",
-                buf.Length, netbase, netbase + 4 * 6 - 1));
+            Say((write ? "パッチ: " : "確認: ") + folder);
+            Say(string.Format("入力ブロック V[{0}..{1}]   メニュー V[{2}] / V[{3}]",
+                netbase, netbase + 4 * 6 - 1,
+                netbase + Patcher.MenuKeyOffset, netbase + Patcher.MenuOpenOffset));
 
-            List<Group> groups;
-            try { groups = Patcher.FindGroups(buf); }
+            List<Target> targets;
+            try { targets = Collect(folder, netbase); }
             catch (Exception ex) { Say("読み取りに失敗しました: " + ex.Message); return; }
 
             int todo = 0, done = 0;
-            foreach (var g in groups)
-            {
-                if (g.Patched) { done++; continue; }
-                todo++;
-            }
+            foreach (var t in targets)
+                foreach (var g in t.Sites) { if (g.Patched) done++; else todo++; }
 
             Say("");
-            foreach (var g in groups)
+            foreach (var t in targets)
             {
-                if (g.Patched)
-                    Say(string.Format("  0x{0:X6}  {1,3}B  すでにパッチ済み", g.Offset, g.Size));
-                else
-                    Say(string.Format("  0x{0:X6}  {1,3}B  {2}P の入力読み取り (indent {3})",
-                        g.Offset, g.Size, g.Player, g.Indent));
+                Say("  " + Path.GetFileName(t.Path));
+                foreach (var g in t.Sites)
+                    Say(string.Format("    0x{0:X6}  {1,3}B  {2}", g.Offset, g.Size,
+                        g.Patched ? "すでにパッチ済み" : g.Describe()));
             }
             Say("");
             Say(string.Format("未パッチ {0} 箇所 / パッチ済み {1} 箇所", todo, done));
@@ -222,18 +256,12 @@ namespace LvKPatch
                 Say("");
                 return;
             }
-
-            if (todo == 0)
-            {
-                Say("書き換える箇所がありません。");
-                Say("");
-                return;
-            }
+            if (todo == 0) { Say("書き換える箇所がありません。"); Say(""); return; }
 
             // コピーを作る場合は、以降はコピー側を書き換える
             if (_makeCopy.Checked)
             {
-                string src = _folder.Text.Trim().TrimEnd(
+                string src = folder.TrimEnd(
                     Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 string dst = _dest.Text.Trim();
                 if (dst.Length == 0) { Say("コピー先を指定してください。"); return; }
@@ -252,34 +280,35 @@ namespace LvKPatch
                 catch (Exception ex) { Say("コピーに失敗しました: " + ex.Message); return; }
                 finally { Cursor = Cursors.Default; }
                 Say("コピーしました。ここから先はコピー側を書き換えます。");
-                ldb = Patcher.LdbPath(dst);
-                buf = File.ReadAllBytes(ldb);
-                groups = Patcher.FindGroups(buf);
+                try { targets = Collect(dst, netbase); }
+                catch (Exception ex) { Say("コピー先の読み取りに失敗しました: " + ex.Message); return; }
             }
 
             // 元のファイルを退避してから書く
-            string bak = ldb + ".bak";
-            try
+            foreach (var t in targets)
             {
-                if (!File.Exists(bak)) File.Copy(ldb, bak);
-                Say("退避: " + bak);
+                bool any = false;
+                foreach (var g in t.Sites) if (!g.Patched) { any = true; break; }
+                if (!any) continue;
+                string bak = t.Path + ".bak";
+                try { if (!File.Exists(bak)) File.Copy(t.Path, bak); }
+                catch (Exception ex) { Say("退避に失敗しました: " + ex.Message); return; }
             }
-            catch (Exception ex) { Say("退避に失敗しました: " + ex.Message); return; }
 
             int applied = 0;
             try
             {
-                foreach (var g in groups)
-                {
-                    if (g.Patched) continue;
-                    var blob = Patcher.MakeReplacement(g, netbase);
-                    Buffer.BlockCopy(blob, 0, buf, g.Offset, blob.Length);
-                    Patcher.Verify(buf, g);
-                    int src = netbase + (g.Player - 1) * 6;
-                    Say(string.Format("  0x{0:X6}  {1}P  ←  V[{2}..{3}] を V[321..326] へ (最初の{4}フレームは無効)",
-                        g.Offset, g.Player, src, src + 5, Patcher.StartGuardFrames));
-                    applied++;
-                }
+                foreach (var t in targets)
+                    foreach (var g in t.Sites)
+                    {
+                        if (g.Patched) continue;
+                        byte[] blob = g.Kind == SiteKind.Input
+                            ? Patcher.MakeReplacement(g, netbase)
+                            : Patcher.MakeMenuReplacement(g, netbase);
+                        Buffer.BlockCopy(blob, 0, t.Buf, g.Offset, blob.Length);
+                        Patcher.Verify(t.Buf, g);
+                        applied++;
+                    }
             }
             catch (Exception ex)
             {
@@ -288,16 +317,23 @@ namespace LvKPatch
                 return;
             }
 
-            try { File.WriteAllBytes(ldb, buf); }
-            catch (Exception ex) { Say("保存に失敗しました: " + ex.Message); return; }
+            foreach (var t in targets)
+            {
+                bool any = false;
+                foreach (var g in t.Sites) if (!g.Patched) { any = true; break; }
+                if (!any) continue;
+                try { File.WriteAllBytes(t.Path, t.Buf); }
+                catch (Exception ex) { Say("保存に失敗しました: " + ex.Message); return; }
+                Say("  書きました: " + Path.GetFileName(t.Path));
+            }
 
             Say("");
             Say(string.Format("{0} 箇所にパッチを当てました。", applied));
-            Say("対象: " + ldb);
             Say("同期ツールの「入力ブロックの先頭」も V[" + netbase + "] にしてください。");
             Say("");
             Say("【重要】このビルドは同期クライアントを動かしていないと、");
             Say("        キャラ選択から先でキーがまったく効きません。");
+            Say("        設定メニュー (Shift) も同期クライアント経由になります。");
             if (_makeCopy.Checked)
                 Say("        ふだん遊ぶときは元のフォルダのほうを使ってください。");
             else
@@ -309,20 +345,32 @@ namespace LvKPatch
         {
             string f = _folder.Text.Trim();
             if (f.Length == 0) return;
-            string ldb = Patcher.LdbPath(f);
-            string bak = ldb + ".bak";
-            if (!File.Exists(bak))
+
+            var baks = new List<string>();
+            string ldbBak = Patcher.LdbPath(f) + ".bak";
+            if (File.Exists(ldbBak)) baks.Add(ldbBak);
+            foreach (string mp in Patcher.MapPaths(f))
+                if (File.Exists(mp + ".bak")) baks.Add(mp + ".bak");
+
+            if (baks.Count == 0)
             {
-                MessageBox.Show("退避ファイルがありません:\n" + bak, "LvKPatch",
+                MessageBox.Show("退避ファイルがありません。", "LvKPatch",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            if (MessageBox.Show("パッチを当てる前の状態に戻します。よろしいですか。", "LvKPatch",
-                    MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            if (MessageBox.Show(
+                    string.Format("{0} 個のファイルを、パッチを当てる前の状態に戻します。よろしいですか。",
+                        baks.Count),
+                    "LvKPatch", MessageBoxButtons.OKCancel,
+                    MessageBoxIcon.Question) != DialogResult.OK) return;
             try
             {
-                File.Copy(bak, ldb, true);
-                Say("元に戻しました: " + ldb);
+                foreach (string bak in baks)
+                {
+                    string dst = bak.Substring(0, bak.Length - 4);
+                    File.Copy(bak, dst, true);
+                    Say("戻しました: " + Path.GetFileName(dst));
+                }
                 Say("");
             }
             catch (Exception ex) { Say("戻せませんでした: " + ex.Message); }
