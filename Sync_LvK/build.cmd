@@ -12,11 +12,11 @@ if not exist "%~dp0Client\bin" mkdir "%~dp0Client\bin"
 set GUIREF=-r:System.Windows.Forms.dll -r:System.Drawing.dll
 
 echo [1/5] Server\bin\LvKSyncServerGui.exe ^(‰æ–Ê‚ ‚è^)
-"%CSC%" -nologo -platform:x64 -optimize+ -target:winexe %GUIREF% -out:"%~dp0Server\bin\LvKSyncServerGui.exe" "%~dp0src\Common.cs" "%~dp0src\ServerGui.cs"
+"%CSC%" -nologo -platform:x64 -optimize+ -target:winexe %GUIREF% -out:"%~dp0Server\bin\LvKSyncServerGui.exe" "%~dp0src\Common.cs" "%~dp0src\InputView.cs" "%~dp0src\ServerGui.cs"
 if errorlevel 1 goto :fail
 
 echo [2/5] Client\bin\LvKSyncClientGui.exe ^(‰æ–Ê‚ ‚è^)
-"%CSC%" -nologo -platform:x64 -optimize+ -target:winexe %GUIREF% -out:"%~dp0Client\bin\LvKSyncClientGui.exe" "%~dp0src\Common.cs" "%~dp0src\GamePatch.cs" "%~dp0src\ClientGui.cs"
+"%CSC%" -nologo -platform:x64 -optimize+ -target:winexe %GUIREF% -out:"%~dp0Client\bin\LvKSyncClientGui.exe" "%~dp0src\Common.cs" "%~dp0src\InputView.cs" "%~dp0src\GamePatch.cs" "%~dp0src\ClientGui.cs"
 if errorlevel 1 goto :fail
 
 echo [3/5] Server\bin\LvKSyncServer.exe ^(ƒRƒ}ƒ“ƒh”Å^)

@@ -127,6 +127,21 @@ namespace LvKSync
         public volatile ushort LocalMask;
         public volatile string[] Roster = new string[Proto.MaxPlayers + 1];
         public volatile ushort[] RemoteMasks = new ushort[Proto.MaxPlayers];
+
+        /// <summary>実際にゲームへ書いた入力の履歴。届いたものを絵で見せるために残す。</summary>
+        public readonly ushort[,] History = new ushort[Proto.MaxPlayers + 1, InputView.HistorySize];
+        public volatile int HistoryPos;
+
+        /// <summary>いまゲームへ書いている入力。</summary>
+        public volatile ushort[] AppliedMasks = new ushort[Proto.MaxPlayers];
+
+        private void PushHistory(ushort[] applied)
+        {
+            int hp = HistoryPos;
+            for (int i = 1; i <= Proto.MaxPlayers; i++) History[i, hp] = applied[i - 1];
+            HistoryPos = (hp + 1) % InputView.HistorySize;
+            AppliedMasks = applied;
+        }
         public long TxCount, RxCount;
         public long VarBase;
         public int Pid;
@@ -675,6 +690,7 @@ namespace LvKSync
                     }
                     haveWritten = true;
                     FrameLag = 0;
+                    PushHistory((ushort[])lastWritten.Clone());
 
                     // 突き合わせは 600 変数ほど読むので重い。ここでやると
                     // ゲームのフレームを見逃すため、番号を渡すだけにして別スレッドに任せる。
@@ -755,6 +771,7 @@ namespace LvKSync
                     haveWritten = true;
                     AppliedFrame = 0;
                     FrameLag = 0;
+                    PushHistory((ushort[])lastWritten.Clone());
                 }
             }
         }
@@ -798,7 +815,9 @@ namespace LvKSync
         private readonly ListView _list = new ListView();
         private readonly Label _netLine = new Label();
         private readonly TextBox _log = new TextBox();
+        private readonly InputView _view = new InputView();
         private readonly WinTimer _timer = new WinTimer();
+        private readonly WinTimer _viewTimer = new WinTimer();
         private FileLogger _file;
 
         private long _lastTx, _lastRx;
@@ -810,8 +829,8 @@ namespace LvKSync
                 "LvKSyncClient.ini");
 
             Text = "LvKSync プレイヤー";
-            ClientSize = new Size(700, 680);
-            MinimumSize = new Size(660, 600);
+            ClientSize = new Size(760, 840);
+            MinimumSize = new Size(700, 720);
             Font = new Font("Yu Gothic UI", 9F);
             StartPosition = FormStartPosition.CenterScreen;
 
@@ -825,6 +844,10 @@ namespace LvKSync
             _timer.Interval = 500;
             _timer.Tick += delegate { RefreshAll(); };
             _timer.Start();
+
+            _viewTimer.Interval = 50;
+            _viewTimer.Tick += delegate { if (_engine.Running) _view.Invalidate(); };
+            _viewTimer.Start();
 
             RefreshAll();
         }
@@ -847,6 +870,23 @@ namespace LvKSync
                 Dock = DockStyle.Top,
                 Height = 22,
                 Text = "  ログ",
+                TextAlign = ContentAlignment.MiddleLeft
+            });
+
+            // 届いている入力を絵で見る
+            _view.Dock = DockStyle.Top;
+            _view.Height = InputView.PreferredHeight;
+            _view.History = _engine.History;
+            _view.HistoryPos = delegate { return _engine.HistoryPos; };
+            _view.MySlot = delegate { return _engine.MySlot; };
+            _view.SlotNames = delegate { return _engine.Roster; };
+            _view.SlotMasks = delegate { return _engine.AppliedMasks; };
+            Controls.Add(_view);
+            Controls.Add(new Label
+            {
+                Dock = DockStyle.Top,
+                Height = 20,
+                Text = "  届いている入力  (左が古く、右が今)",
                 TextAlign = ContentAlignment.MiddleLeft
             });
 
@@ -1369,6 +1409,7 @@ namespace LvKSync
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             _timer.Stop();
+            _viewTimer.Stop();
             SaveSettings();
             if (_engine.Running) _engine.Stop();
             if (_file != null) { _file.Dispose(); _file = null; }
