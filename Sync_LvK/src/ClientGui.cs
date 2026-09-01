@@ -113,6 +113,55 @@ namespace LvKSync
         /// <summary>設定メニューを開け閉めするキー。ゲーム本来の Shift に合わせてある。</summary>
         public int MenuKey = 0x10;
 
+        /// <summary>カーソルを初期化するキー。ゲーム本来の 1 に合わせてある。</summary>
+        public int ResetKey = 0x31;
+
+        // --- キャラ選択の照合 ---
+        //
+        // 試合中のずれ検知はゲームのフレーム番号を鍵にしているが、
+        // キャラ選択には進むフレームが無い。代わりに
+        // 「状態は誰かがキーを押すまで変わらない」性質を使う。
+        // 同じ値が何回続いたか (落ち着き) を一緒に送り、
+        // サーバーは全員が落ち着いてから食い違いを判定する。
+        // 実測すると、キャラ選択で静止中に動く変数は V[99] だけで、
+        // それは見張る範囲に入っていない。
+
+        /// <summary>何フレームおきに送るか。</summary>
+        private const int SelEvery = 15;
+
+        /// <summary>初期化の合図をゲームへ押し続けるフレーム数。</summary>
+        private const int ResetPulseFrames = 8;
+
+        public volatile uint SelHash;
+        public volatile int SelStable;
+        public volatile int SelState = Proto.SelUnknown;
+        public volatile int SelPeers;
+        private int[][] _selBufs;
+        private int _selTick;
+        private bool _resetWasDown;
+        private int _resetPulseLeft;
+        private volatile bool _wantReset;
+        private bool _heldForJoin;
+        private static readonly ushort[] ZeroMasks = new ushort[Proto.MaxPlayers];
+
+        /// <summary>いま何をしているか。画面に出す。</summary>
+        public volatile string Where = "";
+
+        /// <summary>つながっている人数。</summary>
+        public int ConnectedCount
+        {
+            get
+            {
+                int bits = ConnectedBits, n = 0;
+                for (int i = 0; i < Proto.MaxPlayers; i++)
+                    if ((bits & (1 << i)) != 0) n++;
+                return n;
+            }
+        }
+
+        /// <summary>サーバーが待っている人数ぶん、全員つながっているか。</summary>
+        public bool AllConnected { get { return ConnectedCount >= MaxPlayers; } }
+
         // --- 設定メニュー (キャラ選択で Shift) ---
         //
         // ゲーム側のキー読みをパッチで潰してあるので、ここから入れてやらないと
@@ -220,6 +269,8 @@ namespace LvKSync
         {
             _stop = false;
             MySlot = 0; RttMs = -1; TxCount = 0; RxCount = 0; VarBase = 0; Pid = 0;
+            SelState = Proto.SelUnknown; SelStable = 0; SelHash = 0; SelPeers = 0;
+            Where = ""; _heldForJoin = false; _resetPulseLeft = 0; _wantReset = false;
             _serverFrame = -1; AppliedFrame = 0; FrameLag = 0; InMatch = false; StallCount = 0;
             _matchBase = int.MinValue; _gameFrame = 0;
             _minGameFrame = 0; _maxGameFrame = 0; _sendDelay = 0;
@@ -433,6 +484,82 @@ namespace LvKSync
             new Thread(PingLoop) { IsBackground = true }.Start();
 
             MainLoop(needIndex);
+        }
+
+        /// <summary>
+        /// キャラ選択の状態を突き合わせるための値を作って送る。
+        /// </summary>
+        private void SelectTick(GameMemory mem, NetworkStream st)
+        {
+            if (++_selTick < SelEvery) return;
+            _selTick = 0;
+            if (_selBufs == null)
+            {
+                _selBufs = new int[Proto.SelectFirsts.Length][];
+                for (int r = 0; r < _selBufs.Length; r++)
+                    _selBufs[r] = new int[Proto.SelectCounts[r]];
+            }
+            uint h = 2166136261;
+            unchecked
+            {
+                for (int r = 0; r < Proto.SelectFirsts.Length; r++)
+                {
+                    var buf = _selBufs[r];
+                    if (!mem.ReadSpan(Proto.SelectFirsts[r], buf.Length, buf)) return;
+                    for (int i = 0; i < buf.Length; i++)
+                    {
+                        uint v = (uint)buf[i];
+                        h = (h ^ (v & 0xFF)) * 16777619;
+                        h = (h ^ ((v >> 8) & 0xFF)) * 16777619;
+                        h = (h ^ ((v >> 16) & 0xFF)) * 16777619;
+                        h = (h ^ (v >> 24)) * 16777619;
+                    }
+                }
+            }
+            if (h == SelHash) { if (SelStable < 255) SelStable++; }
+            else { SelHash = h; SelStable = 0; }
+            try
+            {
+                var pk = Proto.Build(Proto.MsgSelCheck,
+                    Proto.SelCheckPayload(MySlot, SelHash, SelStable));
+                lock (st) st.Write(pk, 0, pk.Length);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// カーソルの初期化。押した人が全員へ配り、それぞれのゲームが
+        /// 自分の初期化処理を走らせる。ゲーム本来の 1 キーの道をそのまま
+        /// 通るので、選んだキャラは残る (作者の作りどおり)。
+        /// </summary>
+        private void ResetTick(GameMemory mem, NetworkStream st)
+        {
+            bool down = Util.KeyDown(ResetKey);
+            if (down && !_resetWasDown && _resetPulseLeft == 0)
+            {
+                try
+                {
+                    var pk = Proto.Build(Proto.MsgReset, new byte[] { (byte)MySlot });
+                    lock (st) st.Write(pk, 0, pk.Length);
+                    TxCount++;
+                }
+                catch { }
+                _wantReset = true;
+                Say("カーソルの初期化を全員へ送りました。");
+            }
+            _resetWasDown = down;
+
+            if (_wantReset && _resetPulseLeft == 0)
+            {
+                _wantReset = false;
+                _resetPulseLeft = ResetPulseFrames;
+            }
+            if (_resetPulseLeft > 0)
+            {
+                mem.WriteVar(NetBase + Patcher.ResetKeyOffset, Patcher.ResetKeyCode);
+                if (--_resetPulseLeft == 0)
+                    mem.WriteVar(NetBase + Patcher.ResetKeyOffset, 0);
+            }
         }
 
         /// <summary>
@@ -695,6 +822,17 @@ namespace LvKSync
                         }
                     }
                 }
+                else if (type == Proto.MsgSelState && p.Length >= 2)
+                {
+                    if (SelState != p[0]) Bump();
+                    SelState = p[0];
+                    SelPeers = p[1];
+                }
+                else if (type == Proto.MsgReset)
+                {
+                    // 誰かが初期化を押した。自分のゲームにも同じことをする。
+                    _wantReset = true;
+                }
                 else if (type == Proto.MsgSetting && p.Length >= 2)
                 {
                     // 対戦オプション画面からの変更要求。1P のクライアントだけが従う。
@@ -899,6 +1037,7 @@ namespace LvKSync
                     if (lastTick > 0 && tick > lastTick + 1) MissedTicks += tick - lastTick - 1;
                     lastTick = tick;
                     AppliedFrame = tick;
+                    Where = string.Format("試合中  frame={0}", tick);
 
                     ushort mask = 0;
                     for (int i = 0; i < Buttons; i++)
@@ -1004,7 +1143,41 @@ namespace LvKSync
                     if (behind > frameMs * 4) nextDue = pacer.Elapsed.TotalMilliseconds + frameMs;
                     localFrame++;
 
-                    MenuTick(mem, st);
+                    // 全員がそろうまでは、誰の入力もゲームへ入れない。
+                    // 先に接続した人のキーが、まだ起動中の人には届かず、
+                    // その時点でカーソルがずれてしまうため。
+                    bool ready = AllConnected;
+                    if (!ready)
+                    {
+                        Where = string.Format("全員がそろうのを待っています ({0}/{1})",
+                            ConnectedCount, MaxPlayers);
+                        if (!_heldForJoin)
+                        {
+                            _heldForJoin = true;
+                            for (int s2 = 0; s2 < Proto.MaxPlayers; s2++)
+                            {
+                                int b2 = NetBase + s2 * Buttons;
+                                for (int i = 0; i < Buttons; i++) mem.WriteVar(b2 + i, 0);
+                                lastWritten[s2] = 0;
+                            }
+                            haveWritten = true;
+                            Say(string.Format("全員がそろうまで入力を止めています ({0}/{1})",
+                                ConnectedCount, MaxPlayers));
+                        }
+                    }
+                    else
+                    {
+                        if (_heldForJoin)
+                        {
+                            _heldForJoin = false;
+                            haveWritten = false;
+                            Say("全員そろいました。入力を流します。");
+                        }
+                        MenuTick(mem, st);
+                        ResetTick(mem, st);
+                        SelectTick(mem, st);
+                        Where = MenuOpen ? "設定メニュー (1P が操作中)" : "キャラ選択中";
+                    }
 
                     ushort mask = 0;
                     for (int i = 0; i < Buttons; i++)
@@ -1012,14 +1185,14 @@ namespace LvKSync
                     // 設定メニューが開いている間は、キャラ選択のカーソルを動かさない。
                     // メニューの中で押している方向キーが、メニューに入れていない
                     // インスタンスのカーソルを動かしてしまうのを防ぐ。
-                    if (MenuOpen) mask = 0;
+                    if (MenuOpen || !ready) mask = 0;
                     LocalMask = mask;
 
                     var pkt = Proto.Build(Proto.MsgInput, Proto.InputPayload(MySlot, 0, mask));
                     try { lock (st) st.Write(pkt, 0, pkt.Length); TxCount++; }
                     catch { Say("サーバーとの接続が切れました。"); break; }
 
-                    var cur = RemoteMasks;
+                    var cur = ready ? RemoteMasks : ZeroMasks;
                     for (int s = 1; s <= Proto.MaxPlayers; s++)
                     {
                         ushort mk = cur[s - 1];
@@ -1072,6 +1245,7 @@ namespace LvKSync
         private readonly CheckBox _applyOwn = new CheckBox();
 
         private readonly Label _big = new Label();
+        private readonly Label _where = new Label();
         private readonly Label _stat = new Label();
         private readonly ListView _list = new ListView();
         private readonly Label _netLine = new Label();
@@ -1090,7 +1264,7 @@ namespace LvKSync
                 "LvKSyncClient.ini");
 
             Text = "LvKSync プレイヤー";
-            ClientSize = new Size(760, 840);
+            ClientSize = new Size(760, 870);
             MinimumSize = new Size(700, 720);
             Font = new Font("Yu Gothic UI", 9F);
             StartPosition = FormStartPosition.CenterScreen;
@@ -1175,6 +1349,14 @@ namespace LvKSync
             _stat.TextAlign = ContentAlignment.MiddleLeft;
             _stat.ForeColor = Color.FromArgb(60, 60, 60);
             Controls.Add(_stat);
+
+            // 「いまどこにいるか」と「キャラ選択が揃っているか」。
+            // 何か起きたときに、ログを読まずに切り分けられるようにする。
+            _where.Dock = DockStyle.Top;
+            _where.Height = 26;
+            _where.Font = new Font("Yu Gothic UI", 9.5F);
+            _where.TextAlign = ContentAlignment.MiddleLeft;
+            Controls.Add(_where);
 
             _big.Dock = DockStyle.Top;
             _big.Height = 44;
@@ -1364,6 +1546,44 @@ namespace LvKSync
         }
 
         #endregion
+
+        /// <summary>いまの居場所と、キャラ選択が揃っているかを1行で出す。</summary>
+        private void RefreshWhere()
+        {
+            if (!_engine.Running)
+            {
+                _where.Text = "";
+                return;
+            }
+            string w = _engine.Where;
+            if (w.Length == 0) w = "接続中…";
+            string sel = "";
+            var col = Color.FromArgb(90, 90, 90);
+            switch (_engine.SelState)
+            {
+                case Proto.SelSame:
+                    sel = "   ●  キャラ選択は揃っています";
+                    col = Color.FromArgb(20, 110, 60);
+                    break;
+                case Proto.SelDiffer:
+                    sel = "   ×  キャラ選択がずれています   " + KeyLabel(_engine.ResetKey) +
+                          " キーで全員のカーソルを初期化できます";
+                    col = Color.FromArgb(180, 40, 40);
+                    break;
+                case Proto.SelChecking:
+                    sel = "   …  照合中";
+                    break;
+            }
+            _where.Text = "  " + w + sel;
+            _where.ForeColor = col;
+        }
+
+        private static string KeyLabel(int vk)
+        {
+            if (vk >= 0x30 && vk <= 0x5A) return ((char)vk).ToString();
+            if (vk == 0x10) return "Shift";
+            return "0x" + vk.ToString("X2");
+        }
 
         private void Post(Action a)
         {
@@ -1618,6 +1838,7 @@ namespace LvKSync
                 _big.ForeColor = Color.FromArgb(90, 90, 90);
             }
             if (_keyMode.SelectedIndex == 0) SyncKeyBox();
+            RefreshWhere();
 
             var sb = new StringBuilder("  ");
             long tx = _engine.TxCount, rx = _engine.RxCount;

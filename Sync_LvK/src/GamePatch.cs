@@ -20,6 +20,7 @@
 // 押した時点で他とずれる。そこで2箇所を置き換える。
 //
 //   Shift の判定             11610 V[1]<-Shift    -> 3013 Copy V[netbase+41] -> V[1]
+//   1キーの判定              11610 V[1]<-数字      -> 3013 Copy V[netbase+43] -> V[1]
 //   メニューのキー (LDB側)    11610 V[1]<-キー(待つ) -> 11410 ウェイト 0.0秒
 //                                                    3013 Copy V[netbase+40] -> V[1]
 //
@@ -151,9 +152,10 @@ namespace LvKSync
     /// <summary>置き換える場所の種類。</summary>
     public enum SiteKind
     {
-        Input,      // 対戦・キャラ選択の入力読み取り (6連の 3014)
-        MenuOpen,   // キャラ選択で Shift を押したかの判定
-        MenuKey,    // 設定メニューの中のキー入力
+        Input,        // 対戦・キャラ選択の入力読み取り (6連の 3014)
+        MenuOpen,     // キャラ選択で Shift を押したかの判定
+        MenuKey,      // 設定メニューの中のキー入力
+        SelectReset,  // キャラ選択で 1 を押したかの判定 (カーソルの初期化)
     }
 
     public sealed class Group
@@ -169,9 +171,10 @@ namespace LvKSync
         {
             switch (Kind)
             {
-                case SiteKind.MenuOpen: return "設定メニューを開く判定";
-                case SiteKind.MenuKey:  return "設定メニューのキー入力";
-                default:                return Player + "P の入力読み取り";
+                case SiteKind.MenuOpen:    return "設定メニューを開く判定";
+                case SiteKind.MenuKey:     return "設定メニューのキー入力";
+                case SiteKind.SelectReset: return "カーソル初期化 (1キー) の判定";
+                default:                   return Player + "P の入力読み取り";
             }
         }
     }
@@ -200,8 +203,18 @@ namespace LvKSync
         /// 1=下 2=左 3=右 4=上 5=決定 6=キャンセル。5以上でメニューを閉じる。</summary>
         public const int MenuKeyOffset = 40;
 
-        /// <summary>キャラ選択で設定メニューを開く合図 (netbase からの位置)。11 で開く。</summary>
+        /// <summary>キャラ選択で設定メニューを開く合図 (netbase からの位置)。7 で開く。</summary>
         public const int MenuOpenOffset = 41;
+
+        /// <summary>キャラ選択でカーソルを初期化する合図 (netbase からの位置)。</summary>
+        public const int ResetKeyOffset = 43;
+
+        /// <summary>
+        /// 「1」キーのコード。ツクールの数字キーは 10+数字 を返すので 1 は 11。
+        /// ゲーム側はこのあと値を変換してから「0より大きいか」で見ているので、
+        /// 本物のキーと同じ 11 を入れておけば同じ道を通る。
+        /// </summary>
+        public const int ResetKeyCode = 11;
 
         /// <summary>標準のキー入力の処理。結果は 1=下 2=左 3=右 4=上 5=決定 6=キャンセル 11=Shift。</summary>
         private const int KeyInputProc = 11610;
@@ -232,6 +245,26 @@ namespace LvKSync
 
         /// <summary>Shift の判定に続く分岐。V[1] が 0 より大きいか。</summary>
         private static readonly int[] MenuOpenBranch = { 1, 1, 0, 0, 3, 0 };
+
+        /// <summary>
+        /// 数字キーを見る読み取り。V[1] に、待たない。
+        ///
+        /// キャラ選択の「1 を押すとカーソルが初期化される」がこれ。
+        /// 中身は「キャラ選択のループを抜けて入り直す」で、
+        /// 選んだキャラは残る。作者はここのコードを触っていないかもしれない
+        /// (タイトル画面を廃した結果、戻り先がキャラ選択になった)。
+        ///
+        /// 同じ形は他にもあるので、続く「変換 → V[1] > 0 → ループ中断」まで
+        /// 一致することを条件にする。全ファイル通して1箇所しかない。
+        /// </summary>
+        private static readonly int[] NumberKeySig =
+            { 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0 };
+
+        /// <summary>変数操作。数字キーの値を変換している。</summary>
+        private const int ControlVars = 10220;
+
+        /// <summary>ループ中断。</summary>
+        private const int BreakLoop = 12120;
 
         /// <summary>コモンイベントの呼び出し。設定メニューかどうかの決め手。</summary>
         private const int CallCommon = 12330;
@@ -370,6 +403,19 @@ namespace LvKSync
             return true;
         }
 
+        /// <summary>そこから n コマンドのうちにループ中断があるか。</summary>
+        private static bool Breaks(byte[] b, int p, int n)
+        {
+            for (int k = 0; k < n; k++)
+            {
+                Cmd c;
+                if (!Lcf.ParseCmd(b, p, out c)) return false;
+                if (c.Code == BreakLoop) return true;
+                p = c.Next;
+            }
+            return false;
+        }
+
         /// <summary>そこから n コマンドのうちにコモンイベントの呼び出しがあるか。</summary>
         private static bool CallsCommon(byte[] b, int p, int n)
         {
@@ -446,6 +492,26 @@ namespace LvKSync
                     }
                 }
 
+                // カーソル初期化 (1キー)  11610 + 変換 + 条件分岐(V[1]>0) + ループ中断
+                if (c.Code == KeyInputProc && Same(c.Params, NumberKeySig))
+                {
+                    Cmd c2, c3;
+                    if (Lcf.ParseCmd(b, c.Next, out c2) && c2.Code == ControlVars &&
+                        Lcf.ParseCmd(b, c2.Next, out c3) && c3.Code == 12010 &&
+                        Same(c3.Params, MenuOpenBranch) && Breaks(b, c3.Next, 3))
+                    {
+                        found.Add(new Group
+                        {
+                            Kind = SiteKind.SelectReset,
+                            Offset = i,
+                            Size = c.Next - i,
+                            Indent = c.Indent
+                        });
+                        i = c2.Next;
+                        continue;
+                    }
+                }
+
                 // すでに当ててある箇所も拾う
                 if (c.Code == WaitCmd && c.Params.Length == 2 &&
                     c.Params[0] == 0 && c.Params[1] == 0)
@@ -465,6 +531,19 @@ namespace LvKSync
                         i = c2.Next;
                         continue;
                     }
+                }
+                if (IsMenuCopy(c, netbase + ResetKeyOffset))
+                {
+                    found.Add(new Group
+                    {
+                        Kind = SiteKind.SelectReset,
+                        Offset = i,
+                        Size = c.Next - i,
+                        Indent = c.Indent,
+                        Patched = true
+                    });
+                    i = c.Next;
+                    continue;
                 }
                 if (IsMenuCopy(c, netbase + MenuOpenOffset))
                 {
@@ -491,12 +570,14 @@ namespace LvKSync
             var ms = new MemoryStream();
             int padIndent = g.Indent;
 
-            if (g.Kind == SiteKind.MenuOpen)
+            if (g.Kind == SiteKind.MenuOpen || g.Kind == SiteKind.SelectReset)
             {
-                // Shift を読む代わりに、ネットワークから来た合図を V[1] へ入れる。
-                // すぐ後ろの「V[1] == 11 なら開く」はそのまま残す。
+                // キーを読む代わりに、ネットワークから来た合図を V[1] へ入れる。
+                // すぐ後ろの判定はそのまま残すので、あとはゲーム本来の処理が動く。
+                int src = netbase + (g.Kind == SiteKind.MenuOpen
+                    ? MenuOpenOffset : ResetKeyOffset);
                 var c1 = Lcf.BuildCmd(3013, g.Indent, null,
-                    new int[] { 0, 0, netbase + MenuOpenOffset, 1, 1 });
+                    new int[] { 0, 0, src, 1, 1 });
                 ms.Write(c1, 0, c1.Length);
             }
             else

@@ -383,6 +383,9 @@ namespace LvKSync
         public const byte MsgCheck = 10;   // C->S  [スロット 1][フレーム 4][チェックサム 4]
         public const byte MsgMenu = 11;    // C->S->全員  設定メニューの状態 (1P が配る)
         public const byte MsgSetting = 12; // S->C  設定の変更要求 (1P のクライアントが従う)
+        public const byte MsgSelCheck = 13;// C->S  [スロット 1][ハッシュ 4][落ち着き 1]
+        public const byte MsgSelState = 14;// S->C  [状態 1][人数 1]  キャラ選択が揃っているか
+        public const byte MsgReset = 15;   // C->S->全員  カーソルを初期化する合図
 
         public const int MaxNameBytes = 24;
 
@@ -435,6 +438,49 @@ namespace LvKSync
             slot = p[0]; menuKey = p[1]; menuOpen = p[2];
             for (int i = 0; i < MenuValueCount; i++) vals[i] = p[3 + i];
             return true;
+        }
+
+        /// <summary>
+        /// キャラ選択の状態を表す変数。実測で決めた。
+        ///
+        ///   V[521..528]      確定したキャラ (4人 × 2体)
+        ///   V[604]           カブ
+        ///   V[617..619]      チーム / プレイヤー数 / ライフ
+        ///   V[655]           ステージ
+        ///   V[10001..10040]  4人分のカーソル (10刻みで 列/行/何体目/キャラ番号)
+        ///
+        /// 静止中に動く変数は V[99] だけで、ここには入っていない。
+        /// V[1..100] のような一時変数と V[1001..1400] の作業テーブルは
+        /// 毎フレーム作り直されるので入れてはいけない。
+        /// </summary>
+        public static readonly int[] SelectFirsts = { 521, 604, 617, 655, 10001 };
+        public static readonly int[] SelectCounts = { 8, 1, 3, 1, 40 };
+
+        /// <summary>キャラ選択が揃っているかの見立て。</summary>
+        public const byte SelUnknown = 0;
+        public const byte SelSame = 1;
+        public const byte SelChecking = 2;
+        public const byte SelDiffer = 3;
+
+        public static string SelStateText(int st, int n)
+        {
+            switch (st)
+            {
+                case SelSame: return string.Format("揃っています ({0}人)", n);
+                case SelChecking: return "確認中…";
+                case SelDiffer: return "ずれています";
+                default: return "まだ確認していません";
+            }
+        }
+
+        /// <summary>キャラ選択の状態のハッシュ。[スロット 1][ハッシュ 4][落ち着き 1]</summary>
+        public static byte[] SelCheckPayload(int slot, uint hash, int stable)
+        {
+            var p = new byte[6];
+            p[0] = (byte)slot;
+            Buffer.BlockCopy(BitConverter.GetBytes(hash), 0, p, 1, 4);
+            p[5] = (byte)(stable > 255 ? 255 : stable);
+            return p;
         }
 
         /// <summary>設定の変更要求。[どの項目 1][値 1]</summary>

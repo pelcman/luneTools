@@ -32,6 +32,11 @@ namespace LvKSync
         public DateTime JoinedAt = DateTime.Now;
         public long LastInputMs;
         public bool InputStalled;
+
+        // キャラ選択の照合用
+        public uint SelHash;
+        public int SelStable;
+        public long SelAtMs = -1;
     }
 
     /// <summary>入力を受けて全員へ配るだけの中継。GUI から使う。</summary>
@@ -282,6 +287,19 @@ namespace LvKSync
                         Trace(string.Format("[INFO] {0}P {1} からの入力が戻りました", peer.Slot, peer.Name));
                     }
                 }
+                else if (type == Proto.MsgSelCheck && payload.Length >= 6)
+                {
+                    peer.SelHash = BitConverter.ToUInt32(payload, 1);
+                    peer.SelStable = payload[5];
+                    peer.SelAtMs = _clock.ElapsedMilliseconds;
+                    JudgeSelect();
+                }
+                else if (type == Proto.MsgReset)
+                {
+                    Say(string.Format("{0}P {1} がカーソルの初期化を送りました。全員へ回します。",
+                        peer.Slot, peer.Name));
+                    RelayExcept(Proto.MsgReset, payload, peer.Slot);
+                }
                 else if (type == Proto.MsgMenu)
                 {
                     // 設定メニューの状態。1P が配り、ほかは合わせる。
@@ -373,6 +391,64 @@ namespace LvKSync
                 }
             }
             if (bad != null) Say(bad);
+        }
+
+        /// <summary>キャラ選択が揃っているか。</summary>
+        public volatile int SelState = Proto.SelUnknown;
+        public volatile int SelPeers;
+        private int _lastSelState = -1;
+
+        /// <summary>
+        /// キャラ選択の状態を突き合わせる。
+        ///
+        /// 試合中とちがってフレーム番号という共通の物差しが無いので、
+        /// 「値が変わってから何回同じだったか」を各自に送ってもらい、
+        /// 全員が落ち着いてから食い違いを見る。こうしないと、
+        /// 誰かのカーソルが動いた直後の当たり前の食い違いで
+        /// 「ずれています」と言ってしまう。
+        /// </summary>
+        private void JudgeSelect()
+        {
+            const int StableEnough = 3;
+            const long FreshMs = 3000;
+            var peers = Snapshot();
+            long now = _clock.ElapsedMilliseconds;
+            int n = 0; bool allStable = true; bool same = true;
+            uint first = 0; bool haveFirst = false;
+            for (int i = 1; i <= Proto.MaxPlayers; i++)
+            {
+                var pr = peers[i];
+                if (pr == null || pr.SelAtMs < 0) continue;
+                if (now - pr.SelAtMs > FreshMs) continue;   // 古い報告は使わない
+                n++;
+                if (pr.SelStable < StableEnough) allStable = false;
+                if (!haveFirst) { first = pr.SelHash; haveFirst = true; }
+                else if (pr.SelHash != first) same = false;
+            }
+            int st;
+            if (n < 2) st = Proto.SelUnknown;
+            else if (same) st = Proto.SelSame;
+            else if (!allStable) st = Proto.SelChecking;
+            else st = Proto.SelDiffer;
+            SelState = st;
+            SelPeers = n;
+            if (st != _lastSelState)
+            {
+                _lastSelState = st;
+                if (st == Proto.SelDiffer)
+                    Say("[注意] キャラ選択がずれています。1 キーで全員のカーソルを初期化できます。");
+                else if (st == Proto.SelSame)
+                    Say(string.Format("キャラ選択が揃いました ({0}人)。", n));
+                var pkt = Proto.Build(Proto.MsgSelState,
+                    new byte[] { (byte)st, (byte)n });
+                for (int i = 1; i <= Proto.MaxPlayers; i++)
+                {
+                    if (peers[i] == null) continue;
+                    try { lock (peers[i].Stream) peers[i].Stream.Write(pkt, 0, pkt.Length); }
+                    catch { }
+                }
+                Changed();
+            }
         }
 
         /// <summary>設定メニューの値。1P が配ってきたもの。</summary>
@@ -578,6 +654,7 @@ namespace LvKSync
         private readonly Label _hint = new Label();
         private readonly ComboBox _level = new ComboBox();
         private readonly Label _sync = new Label();
+        private readonly Label _sel = new Label();
         private readonly Button _openLog = new Button();
         private readonly Label _logPath = new Label();
         private readonly WinTimer _timer = new WinTimer();
@@ -680,6 +757,10 @@ namespace LvKSync
             _btn.Text = "開始";
             _btn.Click += OnToggle;
             top.Controls.Add(_btn);
+            _sel.SetBounds(330, 42, 360, 22);
+            _sel.ForeColor = Color.FromArgb(90, 90, 90);
+            _sel.Text = "キャラ選択: まだ確認していません";
+            top.Controls.Add(_sel);
             _sync.SetBounds(330, 73, 360, 20);
             _sync.ForeColor = Color.FromArgb(20, 110, 60);
             _sync.Text = "同期: まだ確認していません";
@@ -714,7 +795,7 @@ namespace LvKSync
             _engine.RosterChanged += delegate { Post(RefreshList); };
 
             _timer.Interval = 500;
-            _timer.Tick += delegate { RefreshList(); RefreshOptions(); };
+            _timer.Tick += delegate { RefreshList(); RefreshOptions(); RefreshSel(); };
             _timer.Start();
 
             // 入力の絵はなめらかに動かしたいので、こちらは細かく描き直す
@@ -796,6 +877,17 @@ namespace LvKSync
                 : !have ? "1P がつながると使えます"
                 : _engine.MenuOpen ? "1P がゲーム内のメニューを開いています"
                 : "変えると 1P のゲームに反映され、全員に配られます";
+        }
+
+        /// <summary>キャラ選択が揃っているかを出す。</summary>
+        private void RefreshSel()
+        {
+            int st = _engine.Running ? _engine.SelState : Proto.SelUnknown;
+            _sel.Text = "キャラ選択: " + Proto.SelStateText(st, _engine.SelPeers);
+            _sel.ForeColor =
+                st == Proto.SelSame ? Color.FromArgb(20, 110, 60) :
+                st == Proto.SelDiffer ? Color.FromArgb(180, 40, 40) :
+                Color.FromArgb(90, 90, 90);
         }
 
         private void Post(Action a)
