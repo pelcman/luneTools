@@ -28,7 +28,6 @@ namespace LvKSync
         public long RxAtLastSample;
         public int GameFrame;
         public int PrevGameFrame;
-        public bool Ready;
         public int RxPerSec;
         public DateTime JoinedAt = DateTime.Now;
         public long LastInputMs;
@@ -93,8 +92,6 @@ namespace LvKSync
         public long DesyncCount;
         public int CheckedFrames;
 
-        /// <summary>全員が準備できているか。</summary>
-        public volatile bool AllReady;
 
         public event Action<string> Log;
         public event Action RosterChanged;
@@ -290,17 +287,6 @@ namespace LvKSync
                     var pong = Proto.Build(Proto.MsgPong, payload);
                     try { lock (st) st.Write(pong, 0, pong.Length); } catch { break; }
                 }
-                else if (type == Proto.MsgReady && payload.Length >= 2)
-                {
-                    bool on = payload[1] != 0;
-                    if (on != peer.Ready)
-                    {
-                        peer.Ready = on;
-                        Say(string.Format("[INFO] {0}P {1} が{2}", peer.Slot, peer.Name,
-                            on ? "準備できました" : "準備を取り消しました"));
-                        BroadcastReady();
-                    }
-                }
                 else if (type == Proto.MsgCheck && payload.Length >= 6)
                 {
                     int cf = BitConverter.ToInt32(payload, 1);
@@ -327,7 +313,6 @@ namespace LvKSync
             try { tcp.Close(); } catch { }
             Say(string.Format("[INFO] {0}P の {1} が退出しました", peer.Slot, peer.Name));
             BroadcastRoster();
-            BroadcastReady();
         }
 
         /// <summary>
@@ -373,32 +358,6 @@ namespace LvKSync
                 }
             }
             if (bad != null) Say(bad);
-        }
-
-        /// <summary>全員そろったかを配る。そろうまでは誰の操作も他へ流れない。</summary>
-        private void BroadcastReady()
-        {
-            var peers = Snapshot();
-            int n = 0, ready = 0;
-            for (int i = 1; i <= Proto.MaxPlayers; i++)
-            {
-                if (peers[i] == null) continue;
-                n++;
-                if (peers[i].Ready) ready++;
-            }
-            bool all = (n > 0 && ready == n);
-            if (all != AllReady)
-            {
-                AllReady = all;
-                Say(all ? string.Format("[INFO] 全員そろいました ({0}人)", n)
-                        : "[INFO] 準備待ちに戻りました");
-            }
-            var pkt = Proto.Build(Proto.MsgAllReady, new byte[] { (byte)(all ? 1 : 0) });
-            for (int i = 1; i <= Proto.MaxPlayers; i++)
-            {
-                if (peers[i] == null) continue;
-                try { lock (peers[i].Stream) peers[i].Stream.Write(pkt, 0, pkt.Length); } catch { }
-            }
         }
 
         /// <summary>フレーム番号付きの入力をそのまま全員へ回す。</summary>
@@ -746,7 +705,6 @@ namespace LvKSync
             _list.Columns.Add("プレイヤー", 80);
             _list.Columns.Add("名前", 170);
             _list.Columns.Add("アドレス", 165);
-            _list.Columns.Add("準備", 60);
             _list.Columns.Add("入力", 80);
             _list.Columns.Add("受信/秒", 70);
             _list.Columns.Add("接続時刻", 80);
@@ -928,7 +886,7 @@ namespace LvKSync
             var peers = _engine.Snapshot();
             _list.BeginUpdate();
             while (_list.Items.Count < Proto.MaxPlayers)
-                _list.Items.Add(new ListViewItem(new string[] { "", "", "", "", "", "", "" }));
+                _list.Items.Add(new ListViewItem(new string[] { "", "", "", "", "", "" }));
             for (int i = 1; i <= Proto.MaxPlayers; i++)
             {
                 var it = _list.Items[i - 1];
@@ -937,7 +895,7 @@ namespace LvKSync
                 if (p == null)
                 {
                     it.SubItems[1].Text = i <= _engine.MaxPlayers ? "空き" : "―";
-                    for (int k = 2; k <= 6; k++) it.SubItems[k].Text = "";
+                    for (int k = 2; k <= 5; k++) it.SubItems[k].Text = "";
                     it.ForeColor = Color.Gray;
                 }
                 else
@@ -947,11 +905,10 @@ namespace LvKSync
                     p.RxPerSec = (int)(d * 1000 / Math.Max(1, _timer.Interval));
                     it.SubItems[1].Text = p.Name;
                     it.SubItems[2].Text = p.Remote;
-                    it.SubItems[3].Text = p.Ready ? "できた" : "まだ";
-                    it.SubItems[4].Text = MaskText(p.Mask);
-                    it.SubItems[5].Text = p.RxPerSec.ToString();
-                    it.SubItems[6].Text = p.JoinedAt.ToString("HH:mm:ss");
-                    it.ForeColor = p.Ready ? Color.Black : Color.FromArgb(160, 110, 20);
+                    it.SubItems[3].Text = MaskText(p.Mask);
+                    it.SubItems[4].Text = p.RxPerSec.ToString();
+                    it.SubItems[5].Text = p.JoinedAt.ToString("HH:mm:ss");
+                    it.ForeColor = Color.Black;
                 }
             }
             _list.EndUpdate();

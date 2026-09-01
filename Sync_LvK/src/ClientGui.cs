@@ -97,15 +97,6 @@ namespace LvKSync
 
         /// <summary>接続するときにゲームを自分で起動するか。</summary>
         public bool LaunchGame;
-
-        /// <summary>
-        /// 準備完了か。押すまでは自分のキーを自分のゲームだけに効かせ、
-        /// ネットワークには流さない。タイトルの操作が他の人へ漏れないようにするため。
-        /// </summary>
-        public volatile bool Ready;
-
-        /// <summary>全員が準備完了になったか (サーバーが知らせる)。</summary>
-        public volatile bool AllReady;
         public int DelayFrames = 2;
         public bool ApplyOwn;
         public int[] Keys = new int[Buttons];
@@ -175,21 +166,6 @@ namespace LvKSync
             // ゲームのフレームを1つでも見逃すと同期が崩れるので、優先して回す
             try { _worker.Priority = ThreadPriority.Highest; } catch { }
             _worker.Start();
-        }
-
-        /// <summary>準備完了を切り替えてサーバーへ知らせる。</summary>
-        public void SetReady(bool on)
-        {
-            Ready = on;
-            var st = _st;
-            if (st == null) return;
-            try
-            {
-                var pkt = Proto.Build(Proto.MsgReady,
-                    new byte[] { (byte)MySlot, (byte)(on ? 1 : 0) });
-                lock (st) st.Write(pkt, 0, pkt.Length);
-            }
-            catch { }
         }
 
         public void Stop()
@@ -452,17 +428,6 @@ namespace LvKSync
                         int m = Mod(frame);
                         _ring[m][slot - 1] = mask;
                         _ringFrame[m][slot - 1] = frame;
-                    }
-                }
-                else if (type == Proto.MsgAllReady && p.Length >= 1)
-                {
-                    bool now = p[0] != 0;
-                    if (now != AllReady)
-                    {
-                        AllReady = now;
-                        Say(now ? "[INFO] 全員そろいました。ここから同期します。"
-                                : "[INFO] 準備待ちに戻りました。");
-                        Bump();
                     }
                 }
                 else if (type == Proto.MsgRoster)
@@ -773,23 +738,14 @@ namespace LvKSync
                         if (Util.KeyDown(Keys[i])) mask |= (ushort)(1 << i);
                     LocalMask = mask;
 
-                    // 全員そろうまでは、誰の操作も一切通さない。
-                    //
-                    // ここで自分だけローカルに動かせるようにすると、
-                    // キャラ選択が同期しないまま各自が進んでしまい、
-                    // 別のキャラで試合が始まってしまう。
-                    // 全員がタイトルで止まって待ち、そろってから一緒に動かす。
-                    bool shared = Ready && AllReady;
-
-                    var pkt = Proto.Build(Proto.MsgInput,
-                        Proto.InputPayload(MySlot, 0, shared ? mask : (ushort)0));
+                    var pkt = Proto.Build(Proto.MsgInput, Proto.InputPayload(MySlot, 0, mask));
                     try { lock (st) st.Write(pkt, 0, pkt.Length); TxCount++; }
                     catch { Say("サーバーとの接続が切れました。"); break; }
 
                     var cur = RemoteMasks;
                     for (int s = 1; s <= Proto.MaxPlayers; s++)
                     {
-                        ushort mk = shared ? cur[s - 1] : (ushort)0;
+                        ushort mk = cur[s - 1];
                         if (haveWritten && mk == lastWritten[s - 1]) continue;
                         int b = NetBase + (s - 1) * Buttons;
                         for (int i = 0; i < Buttons; i++)
@@ -818,7 +774,7 @@ namespace LvKSync
         };
 
         private readonly ClientEngine _engine = new ClientEngine();
-        private readonly string _iniPath;
+        private string _iniPath;
 
         private readonly TextBox _name = new TextBox();
         private readonly TextBox _host = new TextBox();
@@ -826,7 +782,6 @@ namespace LvKSync
         private readonly ComboBox _slot = new ComboBox();
         private readonly NumericUpDown _delay = new NumericUpDown();
         private readonly Button _btn = new Button();
-        private readonly Button _ready = new Button();
         private readonly CheckBox _advanced = new CheckBox();
         private readonly Panel _advPanel = new Panel();
         private readonly TextBox _netbase = new TextBox();
@@ -1011,13 +966,6 @@ namespace LvKSync
             _btn.Text = "接続";
             _btn.Click += OnToggle;
             top.Controls.Add(_btn);
-
-            // 準備完了。押すまでは自分の操作が外へ出ない。
-            _ready.SetBounds(560, 44, 100, 26);
-            _ready.Text = "準備完了";
-            _ready.Enabled = false;
-            _ready.Click += OnReady;
-            top.Controls.Add(_ready);
             Controls.Add(top);
 
             SyncKeyBox();
@@ -1333,16 +1281,6 @@ namespace LvKSync
                 File.Copy(f, f.Replace(src, dst), true);
         }
 
-        private void OnReady(object sender, EventArgs e)
-        {
-            if (!_engine.Running) return;
-            bool now = !_engine.Ready;
-            _engine.SetReady(now);
-            AppendLog(now ? "準備完了にしました。ここから操作が全員へ届きます。"
-                          : "準備を取り消しました。操作は自分のゲームだけに効きます。");
-            RefreshAll();
-        }
-
         private void SetInputs(bool on)
         {
             _name.Enabled = on; _host.Enabled = on; _port.Enabled = on;
@@ -1368,26 +1306,10 @@ namespace LvKSync
             int my = _engine.MySlot;
             if (!_engine.Running && _btn.Text == "切断") { _btn.Text = "接続"; SetInputs(true); }
 
-            _ready.Enabled = _engine.Running && my > 0;
-            _ready.Text = _engine.Ready ? "準備を解除" : "準備完了";
-
             if (my > 0 && _engine.Running)
             {
-                if (!_engine.Ready)
-                {
-                    _big.Text = "  あなたは " + my + "P です  ―  「準備完了」を押すまでゲームは動かせません";
-                    _big.ForeColor = Color.FromArgb(190, 120, 20);
-                }
-                else if (!_engine.AllReady)
-                {
-                    _big.Text = "  あなたは " + my + "P です  ―  ほかの人を待っています";
-                    _big.ForeColor = Color.FromArgb(190, 120, 20);
-                }
-                else
-                {
-                    _big.Text = "  あなたは " + my + "P です  ―  全員そろいました";
-                    _big.ForeColor = Color.FromArgb(20, 110, 60);
-                }
+                _big.Text = "  あなたは " + my + "P です";
+                _big.ForeColor = Color.FromArgb(20, 110, 60);
             }
             else
             {
@@ -1456,7 +1378,7 @@ namespace LvKSync
         /// <summary>起動引数で画面の初期値を埋める。--start があればそのまま接続する。</summary>
         private void ApplyArgs(string[] args)
         {
-            bool auto = false, autoReady = false;
+            bool auto = false;
             for (int i = 0; i < args.Length; i++)
             {
                 string a = args[i];
@@ -1492,23 +1414,15 @@ namespace LvKSync
                     case "--apply-own": _applyOwn.Checked = true; break;
                     case "--game": if (nx != null) { _game.Text = nx; i++; } break;
                     case "--no-launch": _launch.Checked = false; break;
-                    case "--ready": autoReady = true; break;
+                    case "--config":
+                        // 同じPCで2つ動かすときは、設定ファイルを分ける
+                        if (nx != null) { _iniPath = nx; LoadSettings(); i++; }
+                        break;
                     case "--throttle": _engine.ThrottleAhead = true; break;
                 }
             }
             SyncKeyBox();
             if (auto) Shown += delegate { OnToggle(this, EventArgs.Empty); };
-            if (autoReady)
-            {
-                // 検証用。つながったら自動で準備完了にする。
-                var t = new WinTimer { Interval = 1000 };
-                t.Tick += delegate
-                {
-                    if (_engine.Running && _engine.MySlot > 0 && !_engine.Ready)
-                    { _engine.SetReady(true); t.Stop(); RefreshAll(); }
-                };
-                Shown += delegate { t.Start(); };
-            }
         }
 
         [STAThread]

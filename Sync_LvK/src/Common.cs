@@ -381,8 +381,6 @@ namespace LvKSync
         public const byte MsgPong = 8;     // S->C  [stamp 8]  そのまま返す
         public const byte MsgRoster = 9;   // S->C  誰が何Pに座っているか
         public const byte MsgCheck = 10;   // C->S  [スロット 1][フレーム 4][チェックサム 4]
-        public const byte MsgReady = 11;   // C->S  [スロット 1][準備できた 1]
-        public const byte MsgAllReady = 12;// S->C  [全員そろった 1]
 
         public const int MaxNameBytes = 24;
 
