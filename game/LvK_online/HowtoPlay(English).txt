@@ -1,0 +1,93 @@
+◆HowtoPlay LuneChara vs KawaikoChans◆
+
+◆Create your own ultimate tag team!
+
+◆Controls◆
+・Hold down Z and release: “Attack”
+The longer you charge, the stronger the attack!
+
+・X is for tag team actions
+Short press: “Change”
+Long press: Tag Attack “ChangeAttack”
+Press Z while holding X for “CoupleAttack”
+
+・Left/Right keys: “Move”
+・Up key: “Jump”
+
+・Standing still on the ground: “Guard”
+Cannot guard while charging. Stop moving to guard.
+・Walking into an opponent: “Throw”
+If both characters throw simultaneously: “Throw Escape”
+・Down→Forward or Back: “Step” (Only for some characters)
+
+◆Move Types◆
+※Some characters may not have certain moves
+○Moves change based on charge level!
+There are 4 types: Charge 0~3
+　Charge 0 Attack: Release immediately without charging
+　　Charge 1 Attack: Charge slightly
+　　　Charge 2 Attack: Charge longer
+　　　　Charge 3 Attack: Charge to the limit!
+
+○ Holding a directional key when releasing the charge changes the move!
+
+◆Tactical Guide◆
+○Form a tag team!
+You can use FriendAttacks and handle a wider range of opponents.
+○Use FriendAttacks!
+The strongest moves with minimal openings! But they have cooldowns and can't be spammed.
+○Charge up a lot!
+The longer you charge, the stronger the move! But you're vulnerable while charging, so be careful.
+
+◆Handy Tips◆
+・1 key (number)	Back: Usually returns you to the previous screen
+・Shift key	Often brings up menus. Check the screen display
+・F5	Game settings screen: Adjust size, master volume, etc.
+・F12	Reset the game
+
+------------------------------------------------------------------------------------------
+
+◆るねキャラvsカワイコチャンズのあそびかた◆
+
+◆君だけの最強のタッグを作ろう！
+
+◆操作方法◆
+・Ｚ　を長押しして離す　 "攻撃"
+タメるほど　強い攻撃になる！
+・Ｘ　は　タッグ系の行動
+短押しで "Change"
+長押しで　交代攻撃 "ChangeAttack"
+Z押しつつXで　協力攻撃 "CoupleAttack"
+
+・左右キー　で　"移動"
+・上キー　  で　"ジャンプ"
+・地上でじっとする　"ガード"
+タメ中はガードできない、ガードする時はタメずに立ち止まろう
+・相手に歩いて触れる　"投げ"
+お互いが投げをしていると "投げ抜け"
+・下→前or後で　"ステップ"　一部キャラのみ
+
+◆技の種類◆
+※キャラによっては無い事がある
+○タメ段階に応じて技が変わる！
+タメ0~3の4種類ある
+　タメ0攻撃はタメずにすぐ離す
+　　タメ1攻撃は少しタメる
+　　　タメ2攻撃は長くタメる
+　　　　タメ3攻撃は限界までタメる！
+
+○タメを離す時に方向キーを押していると技が変化！
+
+◆戦術指南◆
+○タッグを組め！
+ FriendAttackが使えるし、より幅広い相手に対応できる
+○FriendAttackを使え！
+ 隙が少なくて強い最強技！でもクールタイムがあり連発できない
+○いっぱいタメろ！
+ 貯めるほど強い技になる！でもタメ中は無防備なのであぶない
+
+◆お得情報◆
+・１キー（数字）　戻る大体前の画面に戻れる
+・Shiftキー　メニューが出る事が多い画面表示を見て
+・F5　ゲームの設定画面サイズやマスター音量など
+・F12　ゲームをリセット

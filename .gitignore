@@ -21,3 +21,6 @@ desktop.ini
 
 # ログ
 logs/
+
+# 受領時のアーカイブ。中身は game/LvK/ とまったく同じなので追跡しない
+game/LvK.zip
