@@ -33,7 +33,13 @@ namespace LvKSync
         public int AheadLimit = 3;
 
         /// <summary>送り先の先読み量の上限。これ以上は伸ばさない。</summary>
-        private const int MaxSendDelay = 30;
+        private const int MaxSendDelay = 12;
+
+        /// <summary>
+        /// 相手のフレーム番号がこれ以上離れていたら、前の試合の値が
+        /// 残っているとみなして無視する。
+        /// </summary>
+        private const int StaleFrameGap = 600;
 
         /// <summary>
         /// 何フレーム先ぶんを前もって書いておくか。
@@ -604,6 +610,10 @@ namespace LvKSync
                             for (int k = 0; k < Proto.MaxPlayers; k++) _ringFrame[i][k] = -1;
                         for (int i = 0; i < Proto.MaxPlayers; i++) lastWritten[i] = 0;
                         haveWritten = false;
+                        // 先読み量は試合ごとに戻す。前の試合の値を引きずると
+                        // 頭のほうの入力が効かなくなる。
+                        _sendDelay = DelayFrames;
+                        _maxGameFrame = 0;
                         Say(string.Format("[INFO] 試合の同期を開始しました  ゲームframe={0}  遅延={1}",
                             tick, DelayFrames));
                     }
@@ -620,10 +630,13 @@ namespace LvKSync
                     // そうしないと、先行している相手が自分の入力を待てずに取りこぼす。
                     // 送り先は増やす方向にしか変えない。減らすと同じフレームへ
                     // 二重に書いてしまい、どちらが残るかが受け手ごとに変わる。
-                    int lag = _maxGameFrame - tick;
-                    if (lag < 0) lag = 0;
+                    // 自分が遅れているぶんだけ先のフレーム宛に送る。
+                    // ただし前の試合の値が残っている相手は無視する。
+                    int mx = _maxGameFrame;
+                    int lag = 0;
+                    if (mx > 0 && mx - tick > 0 && mx - tick < StaleFrameGap) lag = mx - tick;
                     int want = DelayFrames + lag + 2;
-                    if (want > MaxSendDelay) want = MaxSendDelay;     // 暴走よけ
+                    if (want > MaxSendDelay) want = MaxSendDelay;
                     if (want > _sendDelay) _sendDelay = want;
                     if (_sendDelay < DelayFrames) _sendDelay = DelayFrames;
 
@@ -1093,8 +1106,9 @@ namespace LvKSync
             _engine.GamePath = _game.Text.Trim();
             _engine.LaunchGame = _launch.Checked;
 
-            // ゲームにパッチが当たっているか確かめる。無ければここで当てる。
-            if (!EnsurePatched(_engine.GamePath, netbase)) return;
+            // パッチが要るなら、パッチ済みのコピーを作ってそちらへ切り替える
+            if (!EnsurePatched(netbase)) return;
+            _engine.GamePath = _game.Text.Trim();
 
             SaveSettings();
             _engine.Start();
@@ -1104,14 +1118,27 @@ namespace LvKSync
         }
 
         /// <summary>
-        /// ゲームにネットワーク入力の受け取りが入っているか確かめ、
-        /// 入っていなければ当てるか尋ねる。当てない選択なら false を返す。
+        /// ゲームにネットワーク入力の受け取りが入っているか確かめる。
+        /// 入っていなければ、パッチ済みのコピーを作ってそちらへ切り替える。
+        /// 元のフォルダは触らない。ふだん遊ぶゲームが動かなくなるのを避けるため。
         /// </summary>
-        private bool EnsurePatched(string exePath, int netbase)
+        private bool EnsurePatched(int netbase)
         {
-            if (string.IsNullOrEmpty(exePath)) return true;
-            string ldb;
-            try { ldb = Path.Combine(Path.GetDirectoryName(exePath), "RPG_RT.ldb"); }
+            string exePath = _game.Text.Trim();
+            if (exePath.Length == 0) return true;
+            if (!File.Exists(exePath))
+            {
+                MessageBox.Show("ゲームが見つかりません。\n\n" + exePath,
+                    "LvKSync", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+
+            string dir, ldb;
+            try
+            {
+                dir = Path.GetDirectoryName(exePath);
+                ldb = Path.Combine(dir, "RPG_RT.ldb");
+            }
             catch { return true; }
             if (!File.Exists(ldb)) return true;      // 判断できないので通す
 
@@ -1132,19 +1159,79 @@ namespace LvKSync
                 return true;
             }
 
-            var r = MessageBox.Show(
-                "このゲームにはネットワーク入力の受け取りが入っていません。\n" +
-                "いま入れますか。\n\n" +
-                ldb + "\n\n" +
-                "元のファイルは RPG_RT.ldb.bak として残します。\n" +
-                "「いいえ」を選ぶと、ネットワーク越しの操作は効きません。",
-                "パッチが必要です", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (r != DialogResult.Yes)
+            // パッチ済みのコピーを作る場所
+            string dest;
+            try
             {
-                AppendLog("パッチを当てずに続けます。ネットワーク越しの操作は効きません。");
-                return true;
+                string parent = Path.GetDirectoryName(dir.TrimEnd(
+                    Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                string name = Path.GetFileName(dir.TrimEnd(
+                    Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                dest = Path.Combine(parent, name + "_online");
             }
+            catch { return true; }
 
+            var r = MessageBox.Show(
+                "このゲームにはネットワーク入力の受け取りが入っていません。\n\n" +
+                "［はい］  パッチ済みのコピーを作り、そちらを使います (元はそのまま)\n" +
+                "          " + dest + "\n\n" +
+                "［いいえ］このフォルダにそのまま当てます\n" +
+                "          " + dir + "\n" +
+                "          (元の RPG_RT.ldb は .bak に退避します)\n\n" +
+                "パッチ済みのゲームは、同期クライアントなしでは操作できなくなります。",
+                "パッチが必要です", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (r == DialogResult.Cancel)
+            {
+                AppendLog("パッチを当てずに中止しました。");
+                return false;
+            }
+            if (r == DialogResult.No) return PatchInPlace(ldb, buf, groups, netbase);
+
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                if (Directory.Exists(dest))
+                {
+                    var r2 = MessageBox.Show(dest + "\n\nすでにあります。中身を上書きします。よろしいですか。",
+                        "LvKSync", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+                    if (r2 != DialogResult.OK) return false;
+                }
+                AppendLog("コピーしています… " + dest);
+                CopyTree(dir, dest);
+
+                string destLdb = Path.Combine(dest, "RPG_RT.ldb");
+                var buf2 = File.ReadAllBytes(destLdb);
+                var groups2 = Patcher.FindGroups(buf2);
+                int applied = 0;
+                foreach (var g in groups2)
+                {
+                    if (g.Patched) continue;
+                    var blob = Patcher.MakeReplacement(g, netbase);
+                    Buffer.BlockCopy(blob, 0, buf2, g.Offset, blob.Length);
+                    Patcher.Verify(buf2, g);
+                    applied++;
+                }
+                File.WriteAllBytes(destLdb, buf2);
+
+                // 以後はコピーのほうを使う
+                _game.Text = Path.Combine(dest, Path.GetFileName(exePath));
+                SaveSettings();
+                AppendLog(string.Format("パッチ済みのコピーを作りました ({0} 箇所)。", applied));
+                AppendLog("これからはこちらを使います: " + _game.Text);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("コピーまたはパッチに失敗しました。\n\n" + ex.Message,
+                    "LvKSync", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            finally { Cursor = Cursors.Default; }
+            return true;
+        }
+
+        /// <summary>このフォルダにそのまま当てる。元のファイルは .bak に退避する。</summary>
+        private bool PatchInPlace(string ldb, byte[] buf, List<Group> groups, int netbase)
+        {
             try
             {
                 string bak = ldb + ".bak";
@@ -1168,6 +1255,16 @@ namespace LvKSync
                 return false;
             }
             return true;
+        }
+
+        /// <summary>フォルダをまるごと複製する。</summary>
+        private static void CopyTree(string src, string dst)
+        {
+            Directory.CreateDirectory(dst);
+            foreach (string d in Directory.GetDirectories(src, "*", SearchOption.AllDirectories))
+                Directory.CreateDirectory(d.Replace(src, dst));
+            foreach (string f in Directory.GetFiles(src, "*", SearchOption.AllDirectories))
+                File.Copy(f, f.Replace(src, dst), true);
         }
 
         private void SetInputs(bool on)
